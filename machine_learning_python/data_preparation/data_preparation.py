@@ -216,10 +216,12 @@ def get_timestamps_and_paths(directory):
     for filename in os.listdir(directory):
         if filename.endswith(".npy") or filename.endswith(".jpg") or filename.endswith(".mat"):
             seconds, nanoseconds = filename.split('.')[0:2]
-            # Convert seconds and nanoseconds to a single integer timestamp (in nanoseconds)
-            timestamp = int(seconds) * 10 ** 9 + int(nanoseconds)
-            file_path = os.path.join(directory, filename)
-            timestamps_paths[timestamp] = file_path
+            # print(f"seconds: {seconds}\nnanoseconds: {nanoseconds}")
+            if seconds and nanoseconds:
+                # Convert seconds and nanoseconds to a single integer timestamp (in nanoseconds)
+                timestamp = int(seconds) * 10 ** 9 + int(nanoseconds)
+                file_path = os.path.join(directory, filename)
+                timestamps_paths[timestamp] = file_path
 
     return timestamps_paths
 

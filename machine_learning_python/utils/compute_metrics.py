@@ -1,7 +1,10 @@
+import os
+
 import numpy as np
 from data_preparation import data_preparation
 from loaders.rad_cube_loader import RADCUBE_DATASET_TIME, RADCUBE_DATASET
 from sklearn.neighbors import KDTree
+from tqdm import tqdm
 
 
 def compute_metrics(params):
@@ -23,7 +26,7 @@ def compute_metrics(params):
     pfa_cfar = 0
     pfa_radar = 0
 
-    for dataset_dict in val_dataset.data_dict.values():
+    for dataset_dict in tqdm(val_dataset.data_dict.values()):
 
         # Generate lidar_cube
         lidar = dataset_dict['gt_path']
@@ -59,8 +62,8 @@ def compute_metrics(params):
 
         count = count + 1
 
-        if count % 10 == 0:
-            print(str(count))
+        # if count % 10 == 0:
+        #     print(str(count))
 
     print('Pd CFAR: ' + str(pd_cfar / count))
     print('Pd NET: ' + str(pd_radar / count))
@@ -91,7 +94,7 @@ def compute_metrics_time(params):
     pfa_cfar = 0
     pfa_radar = 0
 
-    for dataset_dict in val_dataset.data_dict.values():
+    for dataset_dict in tqdm(val_dataset.data_dict.values()):
         for t in dataset_dict.keys():
 
             # Generate lidar_cube
@@ -119,6 +122,7 @@ def compute_metrics_time(params):
 
             '''
             Uncomment if the CFAR metrics wants to be calculated
+            '''
             
             cfarpc = data_preparation.read_pointcloud(cfar, mode="radar")
             cfarpc = cfarpc[:,0:3]
@@ -127,11 +131,11 @@ def compute_metrics_time(params):
             pd_cfar_aux, pfa_cfar_aux = compute_pd_pfa(lidar_cube, cfar_cube)
             pd_cfar = pd_cfar + pd_cfar_aux
             pfa_cfar = pfa_cfar + pfa_cfar_aux
-            '''
+            # '''
             count = count + 1
 
-            if count % 10 == 0:
-                print(str(count))
+            # if count % 10 == 0:
+            #     print(str(count))
 
     print('Pd CFAR: ' + str(pd_cfar / count))
     print('Pd NET: ' + str(pd_radar / count))

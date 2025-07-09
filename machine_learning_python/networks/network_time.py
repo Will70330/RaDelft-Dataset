@@ -11,6 +11,8 @@ import scipy.io
 import re
 import os
 import torch
+import torch.multiprocessing as mp
+from tqdm import tqdm
 import pytorch_lightning as pl
 import segmentation_models_pytorch as smp
 import torchvision.transforms as transforms
@@ -30,7 +32,8 @@ IN_CHANNELS = 64  # output of the ReduceDNet
 
 # ToDO: Check if goes faster with this:
 torch.set_float32_matmul_precision('medium')
-
+mp.set_start_method("spawn", force=True)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # this gets rid of the Doppler dimension to get a "2D image".
 # We go from B*C*D*H*W to B*C*H*W, H and W are ranges and azimuths
@@ -94,6 +97,10 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         self.model = smp.create_model(
             arch, encoder_name=encoder_name, in_channels=in_channels, classes=out_classes, **kwargs
         )
+
+        # enabling gradient checkpointing for Resnet50
+        if encoder_name == "resnet50" and hasattr(self.model.encoder, 'model'):
+            self.model.encoder.model.set_grad_checkpointing(True)
 
         kernel_size = (3, 5, 7)
 
@@ -172,12 +179,13 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss = self.shared_step(batch, "train")
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=4)
+        actual_batch_size = batch[0].shape[0]
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=actual_batch_size)
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss, pd, pfa = self.shared_step(batch, "valid")
-
+        
         self.log_dict({'val_loss': loss, 'val_pd': pd, 'val_pfa': pfa, }, on_step=False, on_epoch=True, prog_bar=True,
                       logger=True, batch_size=4)
 
@@ -188,42 +196,56 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, patience=1)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=1)
         return {'optimizer': optimizer, 'lr_scheduler': scheduler,
                 'monitor': 'train_loss_epoch'}
 
 
 # main function
-def main(params):
+def main(params, resume_checkpoint=None):
     # Create training and validation datasets
     train_dataset = RADCUBE_DATASET_TIME(mode='train', params=params)
     val_dataset = RADCUBE_DATASET_TIME(mode='val', params=params)
 
     # Create training and validation data loaders
-    num_workers = 8
-    train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=num_workers, pin_memory=False)
-    val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=num_workers, pin_memory=False)
-    model = NeuralNetworkRadarDetector("FPN", "resnet18", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
+    batch_size = 2
+    num_workers = 3
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
+    model = NeuralNetworkRadarDetector("FPN", "resnet50", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
 
-    checkpoint_callback = ModelCheckpoint(monitor="val_loss")
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_loss",
+        dirpath="checkpoints-resnet50",
+        filename="model-{epoch:02d}-{val_loss:.4f}",
+        save_top_k=3,   # keep best 3 models
+        mode="min",     # because we're minimizing loss
+        save_last=True, # always save the last checkpoint
+        verbose=True,
+    )
 
     trainer = pl.Trainer(
         accelerator="gpu",
+        devices=1,
         max_epochs=20,
+        # precision="16-mixed",
+        accumulate_grad_batches=2,
         callbacks=[checkpoint_callback, RichProgressBar(leave=True, theme=RichProgressBarTheme(metrics_format='.4e'))],
+        gradient_clip_val=1.0,
     )
     trainer.fit(
         model,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
+        ckpt_path=resume_checkpoint
     )
 
 
-def generate_point_clouds(params):
+def generate_point_clouds(params, print_path=False):
     # Load model
-    path = '../lightning_logs/epoch=15-step=30752.ckpt'
+    path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet50/model-epoch=16-val_loss=0.0004.ckpt'
     checkpoint = torch.load(path)
-    model = NeuralNetworkRadarDetector("FPN", "resnet18", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
+    model = NeuralNetworkRadarDetector("FPN", "resnet50", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
     model.load_state_dict(checkpoint['state_dict'])
     model.eval()
 
@@ -231,10 +253,10 @@ def generate_point_clouds(params):
     val_dataset = RADCUBE_DATASET_TIME(mode='test', params=params)
 
     # Create training and validation data loaders
-    num_workers = 16
+    num_workers = 8
     val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=num_workers, pin_memory=False)
 
-    for batch in val_loader:
+    for batch in tqdm(val_loader, desc="generating point clouds", unit="batch(s)"):
 
         radar_cube, lidar_cube, data_dict = batch
 
@@ -251,16 +273,30 @@ def generate_point_clouds(params):
 
                     cfar_path = data_dict_t["cfar_path"][i]
                     save_path = re.sub(r"radar_.+/", r"network/", cfar_path)
-                    print(save_path)
+                    print(save_path) if print_path else None
+                    # print(save_path)
 
                     np.save(save_path, radar_pc)
 
 
 if __name__ == "__main__":
+    # Fixes potential bug that causes work to conflict with shared memory access and crash
+    # try: 
+    #     mp.set_start_method("spawn", force=True)
+    # except RuntimeError:
+    #     pass # Already Set
+
+    # Force CUDA initialization
+    if torch.cuda.is_available():
+        # torch.cuda.init()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        torch.set_float32_matmul_precision('medium')
+
     params = data_preparation.get_default_params()
 
     # Initialise parameters
-    params["dataset_path"] = 'PATH_TO_DATASET'
+    params["dataset_path"] = '/media/muckelroyiii/ExtremePro/RaDelft/'
     params["train_val_scenes"] = [1,3,4,5,7]
     params["test_scenes"] = [2,6]
     params["train_test_split_percent"] = 0.8
@@ -270,11 +306,13 @@ if __name__ == "__main__":
     # This must be kept to false. If the network without elevation is needed, use network_noElevation.py instead
     params["bev"] = False
 
+    checkpoint_path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet50/last.ckpt'
+
     # This train the NN
-    # main(params)
+    main(params, resume_checkpoint=checkpoint_path)
 
     # This generate the poincloud from the trained NN
-    generate_point_clouds(params)
+    # generate_point_clouds(params)
 
     # This compute the Pd, Pfa and Chamfer distance
-    compute_metrics_time(params)
+    # compute_metrics_time(params)
