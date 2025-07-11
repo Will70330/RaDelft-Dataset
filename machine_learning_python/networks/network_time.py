@@ -33,7 +33,7 @@ IN_CHANNELS = 64  # output of the ReduceDNet
 # ToDO: Check if goes faster with this:
 torch.set_float32_matmul_precision('medium')
 mp.set_start_method("spawn", force=True)
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # this gets rid of the Doppler dimension to get a "2D image".
 # We go from B*C*D*H*W to B*C*H*W, H and W are ranges and azimuths
@@ -99,7 +99,7 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         )
 
         # enabling gradient checkpointing for Resnet50
-        if encoder_name == "resnet50" and hasattr(self.model.encoder, 'model'):
+        if encoder_name == "resnet101" and hasattr(self.model.encoder, 'model'):
             self.model.encoder.model.set_grad_checkpointing(True)
 
         kernel_size = (3, 5, 7)
@@ -180,7 +180,7 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         loss = self.shared_step(batch, "train")
         actual_batch_size = batch[0].shape[0]
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=actual_batch_size)
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=actual_batch_size, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -208,15 +208,15 @@ def main(params, resume_checkpoint=None):
     val_dataset = RADCUBE_DATASET_TIME(mode='val', params=params)
 
     # Create training and validation data loaders
-    batch_size = 2
-    num_workers = 3
+    batch_size = 1
+    num_workers = 8
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
-    model = NeuralNetworkRadarDetector("FPN", "resnet50", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
+    model = NeuralNetworkRadarDetector("FPN", "resnet101", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
 
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
-        dirpath="checkpoints-resnet50",
+        dirpath="checkpoints-resnet101",
         filename="model-{epoch:02d}-{val_loss:.4f}",
         save_top_k=3,   # keep best 3 models
         mode="min",     # because we're minimizing loss
@@ -226,7 +226,7 @@ def main(params, resume_checkpoint=None):
 
     trainer = pl.Trainer(
         accelerator="gpu",
-        devices=1,
+        devices=3,
         max_epochs=20,
         # precision="16-mixed",
         accumulate_grad_batches=2,
@@ -243,9 +243,9 @@ def main(params, resume_checkpoint=None):
 
 def generate_point_clouds(params, print_path=False):
     # Load model
-    path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet50/model-epoch=16-val_loss=0.0004.ckpt'
+    path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet101/model-epoch=04-val_loss=0.0009.ckpt'
     checkpoint = torch.load(path)
-    model = NeuralNetworkRadarDetector("FPN", "resnet50", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
+    model = NeuralNetworkRadarDetector("FPN", "resnet101", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
     model.load_state_dict(checkpoint['state_dict'])
     model.eval()
 
@@ -253,7 +253,7 @@ def generate_point_clouds(params, print_path=False):
     val_dataset = RADCUBE_DATASET_TIME(mode='test', params=params)
 
     # Create training and validation data loaders
-    num_workers = 8
+    num_workers = 10
     val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=num_workers, pin_memory=False)
 
     for batch in tqdm(val_loader, desc="generating point clouds", unit="batch(s)"):
@@ -296,7 +296,7 @@ if __name__ == "__main__":
     params = data_preparation.get_default_params()
 
     # Initialise parameters
-    params["dataset_path"] = '/media/muckelroyiii/ExtremePro/RaDelft/'
+    params["dataset_path"] = '/media/muckelroyiii/Crucial-SSD/RaDelft/'
     params["train_val_scenes"] = [1,3,4,5,7]
     params["test_scenes"] = [2,6]
     params["train_test_split_percent"] = 0.8
@@ -306,13 +306,13 @@ if __name__ == "__main__":
     # This must be kept to false. If the network without elevation is needed, use network_noElevation.py instead
     params["bev"] = False
 
-    checkpoint_path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet50/last.ckpt'
+    #checkpoint_path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet50/last.ckpt'
 
     # This train the NN
-    main(params, resume_checkpoint=checkpoint_path)
+    # main(params)
 
     # This generate the poincloud from the trained NN
-    # generate_point_clouds(params)
+    generate_point_clouds(params)
 
     # This compute the Pd, Pfa and Chamfer distance
-    # compute_metrics_time(params)
+    compute_metrics_time(params)
