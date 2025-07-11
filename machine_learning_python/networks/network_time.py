@@ -57,12 +57,14 @@ class DopplerEncoder(nn.Module):
 
         # Step 1: Convolution parameters to reduce from 240 to 60
         self.conv1 = nn.Conv3d(in_channels, out_channel_1, kernel_size=kernel_size1, stride=stride1, padding=padding1)
-        self.norm1 = nn.BatchNorm3d(32)
+        self.norm1 = nn.GroupNorm(num_groups=8, num_channels=32)
+        # self.norm1 = nn.BatchNorm3d(32)
         self.relu1 = nn.ReLU()
 
         # Step 2: Convolution parameters to reduce from 60 to 15
         self.conv2 = nn.Conv3d(out_channel_1, out_channel_2, kernel_size=kernel_size2, stride=stride2, padding=padding2)
-        self.norm2 = nn.BatchNorm3d(64)
+        self.norm2 = nn.GroupNorm(num_groups=8, num_channels=64)
+        # self.norm2 = nn.BatchNorm3d(64)
         self.relu2 = nn.ReLU()
 
         # Step 3: Pooling parameters to reduce from 15 to 1
@@ -87,7 +89,7 @@ class DopplerEncoder(nn.Module):
 
 class NeuralNetworkRadarDetector(pl.LightningModule):
 
-    def __init__(self, arch, encoder_name, params, in_channels, out_classes, **kwargs):
+    def __init__(self, arch, encoder_name, params, in_channels, out_classes, lr=3e-4, warmup_epochs=5, **kwargs):
         super().__init__()
         self.training_step_outputs = []
         self.validation_step_outputs = []
@@ -95,8 +97,17 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         self.DopplerReducer = DopplerEncoder()
 
         self.model = smp.create_model(
-            arch, encoder_name=encoder_name, in_channels=in_channels, classes=out_classes, **kwargs
+            arch,
+            encoder_name=encoder_name,
+            encoder_weights=None, 
+            in_channels=in_channels, 
+            classes=out_classes, 
+            **kwargs
         )
+
+        # Convert every BN inside the ResNet to SyncBN so BN layers
+        # see the *world-size* batch, not the 1–2 samples on each GPU.
+        self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
 
         # enabling gradient checkpointing for Resnet50
         if encoder_name == "resnet101" and hasattr(self.model.encoder, 'model'):
@@ -193,12 +204,44 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         return self.shared_step(batch, "test")
+    
+    # def on_train_start(self):
+    #     # freeze for the first 5 epochs
+    #     if self.current_epoch == 0:
+    #         for p in self.model.encoder.parameters():
+    #             p.requires_grad_(False)
+
+    # def on_train_epoch_end(self):
+    #     if self.current_epoch == 4:        # un-freeze after warm-up
+    #         for p in self.model.encoder.parameters():
+    #             p.requires_grad_(True)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=1)
-        return {'optimizer': optimizer, 'lr_scheduler': scheduler,
-                'monitor': 'train_loss_epoch'}
+        optimizer = torch.optim.AdamW(self.parameters(),
+                                      lr=self.hparams.lr,
+                                      weight_decay=1e-4)
+        warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=5)
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.trainer.max_epochs - self.hparams.warmup_epochs
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[5]
+        )
+        # optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=1)
+
+        # manual warmup
+        scheduler = {
+            "scheduler": scheduler,
+            "interval": "epoch",
+            "frequency": 1,
+            "monitor": "val_loss",
+        }
+        return {'optimizer': optimizer, 'lr_scheduler': scheduler}
+                # 'monitor': 'train_loss_epoch'}
 
 
 # main function
@@ -212,11 +255,11 @@ def main(params, resume_checkpoint=None):
     num_workers = 8
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
-    model = NeuralNetworkRadarDetector("FPN", "resnet101", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
+    model = NeuralNetworkRadarDetector("FPN", "resnet101", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES, lr=3e-4)
 
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
-        dirpath="checkpoints-resnet101",
+        dirpath="checkpoints-resnet101-optimized",
         filename="model-{epoch:02d}-{val_loss:.4f}",
         save_top_k=3,   # keep best 3 models
         mode="min",     # because we're minimizing loss
@@ -226,10 +269,12 @@ def main(params, resume_checkpoint=None):
 
     trainer = pl.Trainer(
         accelerator="gpu",
+        strategy="ddp",         # We need this for multi-GPU since we want to sync BN
+        sync_batchnorm=True,
         devices=3,
-        max_epochs=20,
-        # precision="16-mixed",
-        accumulate_grad_batches=2,
+        max_epochs=70,
+        precision="16-mixed",
+        accumulate_grad_batches=4,
         callbacks=[checkpoint_callback, RichProgressBar(leave=True, theme=RichProgressBarTheme(metrics_format='.4e'))],
         gradient_clip_val=1.0,
     )
@@ -309,10 +354,10 @@ if __name__ == "__main__":
     #checkpoint_path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet50/last.ckpt'
 
     # This train the NN
-    # main(params)
+    main(params)
 
     # This generate the poincloud from the trained NN
-    generate_point_clouds(params)
+    # generate_point_clouds(params)
 
     # This compute the Pd, Pfa and Chamfer distance
-    compute_metrics_time(params)
+    # compute_metrics_time(params)
