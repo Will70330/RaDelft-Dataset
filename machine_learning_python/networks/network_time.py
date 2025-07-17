@@ -31,19 +31,19 @@ from utils.compute_metrics import compute_metrics_time, compute_pd_pfa
 import wandb
 
 # Start a new wandb run to track this script.
-run = wandb.init(
-    # Set the wandb entity where your project will be logged (generally your team name).
-    entity="will_70330",
-    # Set the wandb project where this run will be logged.
-    project="RISS-Research-RaDelft",
-    # Track hyperparameters and run metadata.
-    config={
-        "learning_rate": 0.001,
-        "architecture": "ResNet152",
-        "dataset": "RaDelft",
-        "epochs": 80,
-    },
-)
+# run = wandb.init(
+#     # Set the wandb entity where your project will be logged (generally your team name).
+#     entity="will_70330",
+#     # Set the wandb project where this run will be logged.
+#     project="RISS-Research-RaDelft",
+#     # Track hyperparameters and run metadata.
+#     config={
+#         "learning_rate": 0.001,
+#         "architecture": "ResNet152",
+#         "dataset": "RaDelft",
+#         "epochs": 80,
+#     },
+# )
 
 OUT_CLASSES = 34  # 44 elevation angles
 IN_CHANNELS = 64  # output of the ReduceDNet
@@ -75,14 +75,14 @@ class DopplerEncoder(nn.Module):
 
         # Step 1: Convolution parameters to reduce from 240 to 60
         self.conv1 = nn.Conv3d(in_channels, out_channel_1, kernel_size=kernel_size1, stride=stride1, padding=padding1)
-        self.norm1 = nn.GroupNorm(num_groups=8, num_channels=32)
-        # self.norm1 = nn.BatchNorm3d(32)
+        # self.norm1 = nn.GroupNorm(num_groups=8, num_channels=32)
+        self.norm1 = nn.BatchNorm3d(32)
         self.relu1 = nn.ReLU()
 
         # Step 2: Convolution parameters to reduce from 60 to 15
         self.conv2 = nn.Conv3d(out_channel_1, out_channel_2, kernel_size=kernel_size2, stride=stride2, padding=padding2)
-        self.norm2 = nn.GroupNorm(num_groups=8, num_channels=64)
-        # self.norm2 = nn.BatchNorm3d(64)
+        # self.norm2 = nn.GroupNorm(num_groups=8, num_channels=64)
+        self.norm2 = nn.BatchNorm3d(64)
         self.relu2 = nn.ReLU()
 
         # Step 3: Pooling parameters to reduce from 15 to 1
@@ -306,7 +306,6 @@ def main(params, resume_checkpoint=None):
         devices=1,
         max_epochs=80,
         # precision="16-mixed",
-        # precision="16-mixed",
         accumulate_grad_batches=8,
         callbacks=[checkpoint_callback, RichProgressBar(leave=True, theme=RichProgressBarTheme(metrics_format='.4e'))],
         gradient_clip_val=0.1,
@@ -320,40 +319,52 @@ def main(params, resume_checkpoint=None):
 
     run.finish()
 
-def generate_point_clouds(params, print_path=False):
-    # Load model
-    path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet101/model-epoch=04-val_loss=0.0009.ckpt'
-    checkpoint = torch.load(path)
-    model = NeuralNetworkRadarDetector("FPN", "resnet101", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
+def generate_point_clouds(params, data_set='test', print_path=False):
+    # Check for GPU availability
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Load model and move to GPU
+    path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet50/model-epoch=15-val_loss=0.0004.ckpt'
+    checkpoint = torch.load(path, map_location=device)  # Load directly to GPU
+    model = NeuralNetworkRadarDetector("FPN", "resnet50", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
     model.load_state_dict(checkpoint['state_dict'])
+    model.to(device)  # Move model to GPU
     model.eval()
 
-    # Create Loader
-    val_dataset = RADCUBE_DATASET_TIME(mode='test', params=params)
-
-    # Create training and validation data loaders
-    num_workers = 10
-    val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=num_workers, pin_memory=False)
+    # Create Loader with GPU-friendly settings
+    val_dataset = RADCUBE_DATASET_TIME(mode=data_set, params=params)
+    val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, 
+                           num_workers=5, pin_memory=False, prefetch_factor=1)  # Enable pin_memory for faster GPU transfer
 
     for batch in tqdm(val_loader, desc="generating point clouds", unit="batch(s)"):
-
         radar_cube, lidar_cube, data_dict = batch
+        
+        # Move data to GPU
+        radar_cube = radar_cube.to(device, non_blocking=True)
+        lidar_cube = lidar_cube.to(device, non_blocking=True)
 
         with torch.no_grad():
-            output = model(radar_cube)
+            output = model(radar_cube)  # Now runs on GPU
+            
+            # Move output back to CPU for post-processing
+            output_cpu = output.cpu()
+            radar_cube_cpu = radar_cube.cpu()
+            
             for i in range(lidar_cube.shape[0]):
                 for t in range(lidar_cube.shape[1]):
-                    output_t = output[i, t, :, :, :]
+                    output_t = output_cpu[i, t, :, :, :]
                     data_dict_t = data_dict[t]
 
-                    radar_pc = data_preparation.cube_to_pointcloud(output_t, params, radar_cube[i, t, :, :, :], 'radar')
+                    radar_pc = data_preparation.cube_to_pointcloud(
+                        output_t, params, radar_cube_cpu[i, t, :, :, :], 'radar'
+                    )
 
                     radar_pc[:, 2] = -radar_pc[:, 2]
 
                     cfar_path = data_dict_t["cfar_path"][i]
                     save_path = re.sub(r"radar_.+/", r"network/", cfar_path)
                     print(save_path) if print_path else None
-                    # print(save_path)
 
                     np.save(save_path, radar_pc)
 
@@ -388,10 +399,10 @@ if __name__ == "__main__":
     checkpoint_path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet152/last-v1.ckpt'
 
     # This train the NN
-    main(params, resume_checkpoint=checkpoint_path)
+    # main(params, resume_checkpoint=checkpoint_path)
 
     # This generate the poincloud from the trained NN
-    # generate_point_clouds(params)
+    generate_point_clouds(params)
 
     # This compute the Pd, Pfa and Chamfer distance
-    # compute_metrics_time(params)
+    compute_metrics_time(params)

@@ -387,8 +387,8 @@ if __name__ == "__main__":
 
     # Initialise parameters
     params["dataset_path"] = '/media/muckelroyiii/ExtremePro/RaDelft'
-    params["train_val_scenes"] = [1, 3]
-    params["test_scenes"] = [2, 6]
+    params["train_val_scenes"] = [4, 5, 7]
+    params["test_scenes"] = []
     params["train_test_split_percent"] = 0.8
     params["cfar_folder"] = 'radar_ososos'
     params["quantile"] = False
@@ -397,7 +397,7 @@ if __name__ == "__main__":
     params["bev"] = False
 
     checkpoint_paths = {
-        '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet18/model-epoch=19-val_loss=0.0004.ckpt',
+        # '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet18/model-epoch=19-val_loss=0.0004.ckpt',
         '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet50/model-epoch=15-val_loss=0.0004.ckpt',
         '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet101/model-epoch=19-val_loss=0.0004.ckpt',
         '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet152/model-epoch=17-val_loss=0.0009.ckpt',
