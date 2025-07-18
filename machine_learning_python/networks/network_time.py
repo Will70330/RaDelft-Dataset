@@ -30,20 +30,7 @@ import torchvision.models as models
 from utils.compute_metrics import compute_metrics_time, compute_pd_pfa
 import wandb
 
-# Start a new wandb run to track this script.
-# run = wandb.init(
-#     # Set the wandb entity where your project will be logged (generally your team name).
-#     entity="will_70330",
-#     # Set the wandb project where this run will be logged.
-#     project="RISS-Research-RaDelft",
-#     # Track hyperparameters and run metadata.
-#     config={
-#         "learning_rate": 0.001,
-#         "architecture": "ResNet152",
-#         "dataset": "RaDelft",
-#         "epochs": 80,
-#     },
-# )
+run = None
 
 OUT_CLASSES = 34  # 44 elevation angles
 IN_CHANNELS = 64  # output of the ReduceDNet
@@ -56,7 +43,7 @@ torch.set_float32_matmul_precision('medium')
 # this gets rid of the Doppler dimension to get a "2D image".
 # We go from B*C*D*H*W to B*C*H*W, H and W are ranges and azimuths
 class DopplerEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, use_groupNorm=False):
         super(DopplerEncoder, self).__init__()
 
         # Parameters
@@ -75,14 +62,12 @@ class DopplerEncoder(nn.Module):
 
         # Step 1: Convolution parameters to reduce from 240 to 60
         self.conv1 = nn.Conv3d(in_channels, out_channel_1, kernel_size=kernel_size1, stride=stride1, padding=padding1)
-        # self.norm1 = nn.GroupNorm(num_groups=8, num_channels=32)
-        self.norm1 = nn.BatchNorm3d(32)
+        self.norm1 = nn.BatchNorm3d(32) if not use_groupNorm else nn.GroupNorm(num_groups=8, num_channels=32)
         self.relu1 = nn.ReLU()
 
         # Step 2: Convolution parameters to reduce from 60 to 15
         self.conv2 = nn.Conv3d(out_channel_1, out_channel_2, kernel_size=kernel_size2, stride=stride2, padding=padding2)
-        # self.norm2 = nn.GroupNorm(num_groups=8, num_channels=64)
-        self.norm2 = nn.BatchNorm3d(64)
+        self.norm2 = nn.BatchNorm3d(64) if not use_groupNorm else nn.GroupNorm(num_groups=8, num_channels=64)
         self.relu2 = nn.ReLU()
 
         # Step 3: Pooling parameters to reduce from 15 to 1
@@ -107,12 +92,13 @@ class DopplerEncoder(nn.Module):
 
 class NeuralNetworkRadarDetector(pl.LightningModule):
 
-    def __init__(self, arch, encoder_name, params, in_channels, out_classes, lr=3e-4, warmup_epochs=10, **kwargs):
+    def __init__(self, arch, encoder_name, params, in_channels, out_classes, lr=3e-4, warmup_epochs=10, use_groupNorm=False, alpha=1.0, **kwargs):
         super().__init__()
         self.training_step_outputs = []
         self.validation_step_outputs = []
         self.save_hyperparameters()
-        self.DopplerReducer = DopplerEncoder()
+        self.DopplerReducer = DopplerEncoder(use_groupNorm=use_groupNorm)
+        self.alpha = alpha
 
         self.model = smp.create_model(
             arch,
@@ -127,19 +113,33 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         # # see the *world-size* batch, not the 1–2 samples on each GPU.
         # self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
 
-        # enabling gradient checkpointing for Resnet50
-        if hasattr(self.model.encoder, 'model'):
-            self.model.encoder.model.set_grad_checkpointing(True)
+        # Enable gradient checkpointing for memory efficiency (optional)
+        # Only use if you're running out of memory
+        # self._enable_gradient_checkpointing()
 
+
+        # Temporal smoothing layers
         kernel_size = (3, 5, 7)
 
         self.conv1 = nn.Conv3d(3, 6, kernel_size=kernel_size, padding='same')
         self.relu1 = nn.ReLU()
         self.conv2 = nn.Conv3d(6, 12, kernel_size=kernel_size, padding='same')
         self.relu2 = nn.ReLU()
-        self.conv3 = nn.Conv3d(12, 6, kernel_size=kernel_size, padding='same')
+        self.conv3 = nn.Conv3d(12, 24, kernel_size=kernel_size, padding='same')
         self.relu3 = nn.ReLU()
-        self.conv4 = nn.Conv3d(6, 3, kernel_size=kernel_size, padding='same')
+        self.conv4 = nn.Conv3d(24, 12, kernel_size=kernel_size, padding='same')
+        self.relu4 = nn.ReLU()
+        self.conv5 = nn.Conv3d(12, 6, kernel_size=kernel_size, padding='same')
+        self.relu5 = nn.ReLU()
+        self.conv6 = nn.Conv3d(6, 3, kernel_size=kernel_size, padding='same')
+
+        self.dropout = nn.Dropout3d(p=0.3)  # Increased dropout for stronger regularization
+
+        # Initialize temporal smoothing layers
+        for m in [self.conv1, self.conv2, self.conv3, self.conv4, self.conv5, self.conv6]:
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
         self.counter = 0
         self.params = params
@@ -172,11 +172,20 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         # Temporal smoothing
         mask = self.conv1(mask)
         mask = self.relu1(mask)
+        mask = self.dropout(mask)
         mask = self.conv2(mask)
         mask = self.relu2(mask)
+        mask = self.dropout(mask)
         mask = self.conv3(mask)
         mask = self.relu3(mask)
+        mask = self.dropout(mask)
         mask = self.conv4(mask)
+        mask = self.relu4(mask)
+        mask = self.dropout(mask)
+        mask = self.conv5(mask)
+        mask = self.relu5(mask)
+        mask = self.dropout(mask)
+        mask = self.conv6(mask)
 
         return mask
 
@@ -187,10 +196,14 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         # item_params = batch[2]
 
         # Run the network
-        RAE_Cube = self.forward(
-            RAD_cube)  # output is a binary dense mask of the cube in RAE format: range, azimuth, elevation
+        RAE_Cube = self.forward(RAD_cube)  # output is a binary dense mask of the cube in RAE format: range, azimuth, elevation
 
         loss = data_preparation.radarcube_lidarcube_loss_time(RAE_Cube, gt_lidar_cube, self.params)
+
+        # Add L1 regularization for additional control over overfitting
+        l1_lambda = 1e-5
+        l1_reg = sum(p.abs().sum() for p in self.parameters() if p.requires_grad)
+        loss = loss + l1_lambda * l1_reg
 
         if stage == 'valid':
             radar_cube_out = RAE_Cube.sigmoid().squeeze().cpu().detach().numpy()
@@ -207,32 +220,31 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss = self.shared_step(batch, "train")
-        actual_batch_size = batch[0].shape[0]
+        actual_batch_size = batch[0].shape[0] # This should be 1 / 2
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=actual_batch_size)
-        run.log({'train_loss': loss.item(), 'lr': self.hparams.lr})
+        
+        # Log to wandb less frequently to reduce overhead
+        if batch_idx % 10 == 0:
+            run.log({'train_loss': loss.item(), 'lr': self.optimizers().param_groups[0]['lr']})
+        
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss, pd, pfa = self.shared_step(batch, "valid")
         
-        self.log_dict({'val_loss': loss, 'val_pd': pd, 'val_pfa': pfa, }, on_step=False, on_epoch=True, prog_bar=True,
-                      logger=True, batch_size=4)
-        run.log({'val_loss': loss.item(), 'val_pd': pd.item(), 'val_pfa': pfa.item(), 'lr': self.hparams.lr})
+        actual_batch_size = batch[0].shape[0] # This should be 1 / 2
+        self.log_dict({'val_loss': loss, 'val_pd': pd, 'val_pfa': pfa, },
+                      on_step=False, on_epoch=True, prog_bar=True,
+                      logger=True, batch_size=actual_batch_size)
+        
+        # Log to wandb less frequently to reduce overhead
+        if batch_idx % 10 == 0:
+            run.log({'val_loss': loss.item(), 'val_pd': pd.item(), 'val_pfa': pfa.item(), 'lr': self.hparams.lr})
+        
         return loss
 
     def test_step(self, batch, batch_idx):
         return self.shared_step(batch, "test")
-    
-    # def on_train_start(self):
-    #     # freeze for the first 5 epochs
-    #     if self.current_epoch == 0:
-    #         for p in self.model.encoder.parameters():
-    #             p.requires_grad_(False)
-
-    # def on_train_epoch_end(self):
-    #     if self.current_epoch == 4:        # un-freeze after warm-up
-    #         for p in self.model.encoder.parameters():
-    #             p.requires_grad_(True)
 
     def on_after_backward(self):
         # Log gradient norms
@@ -245,53 +257,121 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
                 param_count += 1
         total_norm = total_norm ** 0.5
         self.log('grad_norm', total_norm, on_step=True, on_epoch=False)
-        run.log({"grad_norm": total_norm})
+        
+        # Log to wandb less frequently
+        if self.global_step % 10 == 0:
+            run.log({"grad_norm": total_norm})
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(),
                                       lr=self.hparams.lr,
-                                      weight_decay=5e-5)
-        warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.005, total_iters=10)
-        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.trainer.max_epochs - 10,
-            eta_min=1e-6,
+                                      weight_decay=1e-4)  # Increased weight decay for stronger L2 regularization
+
+        # Warmup scheduler - crucial for stable training with batch_size=1
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, 
+            start_factor=0.01,  # Start at 1% of target LR (more conservative than 0.005)
+            total_iters=self.hparams.warmup_epochs
         )
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
+        
+        # Cosine annealing with warm restarts
+        cosine = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=10,      # First restart after 10 epochs
+            T_mult=2,    # Double the period after each restart (10, 20, 40, ...)
+            eta_min=1e-7 # Minimum learning rate
+        )
+        
+        # Combine warmup and cosine schedules
+        base_scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer,
             schedulers=[warmup, cosine],
-            milestones=[10]
+            milestones=[self.hparams.warmup_epochs]
         )
+        
+        # Add ReduceLROnPlateau on top for additional adaptation
+        plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.7,      # Less aggressive reduction since we have cosine
+            patience=8,      # Higher patience to let cosine schedule work
+            verbose=True,
+            min_lr=1e-8      # Lower than cosine min_lr
+        )
+
         # optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
         # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=1)
 
-        # manual warmup
-        scheduler = {
-            "scheduler": scheduler,
-            "interval": "epoch",
-            "frequency": 1,
-            "monitor": "val_loss",
-        }
-        return {'optimizer': optimizer, 'lr_scheduler': scheduler}
-                # 'monitor': 'train_loss_epoch'}
+        # Return both schedulers - PyTorch Lightning will handle them correctly
+        return [optimizer], [
+            {
+                'scheduler': base_scheduler
+            }, 
+            {
+                'scheduler': plateau_scheduler,
+                'monitor': 'val_loss',
+                'interval': 'epoch',
+                'frequency': 1
+            }      
+        ]
 
 
 # main function
 def main(params, resume_checkpoint=None):
+    # Start a new wandb run to track this script.
+    global run
+    checkpointt_directory = "checkpoints-resnet152"
+    if resume_checkpoint:
+        ckpt_dir = os.path.dirname(resume_checkpoint)
+    else: 
+        ckpt_dir = checkpointt_directory
+        
+    run_id_file = os.path.join(ckpt_dir, "wandb_run_id.txt")
+    if resume_checkpoint and os.path.exists(run_id_file):
+        # Load old run ID and re-attach
+        with open(run_id_file, "r") as f:
+            old_id = f.read().strip()
+        run = wandb.init(
+            entity="will_70330",
+            project="RISS-Research-RaDelft",
+            config={
+                "architecture": "ResNet152-regularized-deep-temporal",
+                "dataset": "RaDelft",
+                "epochs": 80,
+            },
+            id=old_id,
+            resume="allow"
+        )
+    else:
+        # Brand new run
+        run = wandb.init(
+            entity="will_70330",
+            project="RISS-Research-RaDelft",
+            config={
+                "architecture": "ResNet152-regularized-deep-temporal",
+                "dataset": "RaDelft",
+                "epochs": 80,
+            }
+        )
+        # check for exisiting checkpoint folder and write run ID
+        os.makedirs(ckpt_dir, exist_ok=True)
+        with open(run_id_file, 'w') as f:
+            f.write(run.id)
+
     # Create training and validation datasets
     train_dataset = RADCUBE_DATASET_TIME(mode='train', params=params)
     val_dataset = RADCUBE_DATASET_TIME(mode='val', params=params)
 
     # Create training and validation data loaders
-    batch_size = 1
-    num_workers = 5
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False, prefetch_factor=2)
+    batch_size = 2  # Limited by GPU memory
+    num_workers = 5 # Limited by CPU
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False, prefetch_factor=1)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
     model = NeuralNetworkRadarDetector("FPN", "resnet152", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES, lr=1e-4)
 
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
-        dirpath="checkpoints-resnet152",
+        dirpath=checkpointt_directory,
         filename="model-{epoch:02d}-{val_loss:.4f}",
         save_top_k=3,   # keep best 3 models
         mode="min",     # because we're minimizing loss
@@ -301,14 +381,14 @@ def main(params, resume_checkpoint=None):
 
     trainer = pl.Trainer(
         accelerator="gpu",
-        strategy="ddp",         # We need this for multi-GPU / High Accumulated Batches since we want to sync BN
+        strategy="auto",         # We need this for multi-GPU / High Accumulated Batches since we want to sync BN
         sync_batchnorm=True,
         devices=1,
         max_epochs=80,
-        # precision="16-mixed",
-        accumulate_grad_batches=8,
+        precision="16-mixed",
+        accumulate_grad_batches=4,
         callbacks=[checkpoint_callback, RichProgressBar(leave=True, theme=RichProgressBarTheme(metrics_format='.4e'))],
-        gradient_clip_val=0.1,
+        gradient_clip_val=0.2,
     )
     trainer.fit(
         model,
@@ -319,58 +399,9 @@ def main(params, resume_checkpoint=None):
 
     run.finish()
 
-def generate_point_clouds(params, data_set='test', print_path=False):
-    # Check for GPU availability
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Load model and move to GPU
-    path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet50/model-epoch=15-val_loss=0.0004.ckpt'
-    checkpoint = torch.load(path, map_location=device)  # Load directly to GPU
-    model = NeuralNetworkRadarDetector("FPN", "resnet50", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
-    model.load_state_dict(checkpoint['state_dict'])
-    model.to(device)  # Move model to GPU
-    model.eval()
-
-    # Create Loader with GPU-friendly settings
-    val_dataset = RADCUBE_DATASET_TIME(mode=data_set, params=params)
-    val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, 
-                           num_workers=5, pin_memory=False, prefetch_factor=1)  # Enable pin_memory for faster GPU transfer
-
-    for batch in tqdm(val_loader, desc="generating point clouds", unit="batch(s)"):
-        radar_cube, lidar_cube, data_dict = batch
-        
-        # Move data to GPU
-        radar_cube = radar_cube.to(device, non_blocking=True)
-        lidar_cube = lidar_cube.to(device, non_blocking=True)
-
-        with torch.no_grad():
-            output = model(radar_cube)  # Now runs on GPU
-            
-            # Move output back to CPU for post-processing
-            output_cpu = output.cpu()
-            radar_cube_cpu = radar_cube.cpu()
-            
-            for i in range(lidar_cube.shape[0]):
-                for t in range(lidar_cube.shape[1]):
-                    output_t = output_cpu[i, t, :, :, :]
-                    data_dict_t = data_dict[t]
-
-                    radar_pc = data_preparation.cube_to_pointcloud(
-                        output_t, params, radar_cube_cpu[i, t, :, :, :], 'radar'
-                    )
-
-                    radar_pc[:, 2] = -radar_pc[:, 2]
-
-                    cfar_path = data_dict_t["cfar_path"][i]
-                    save_path = re.sub(r"radar_.+/", r"network/", cfar_path)
-                    print(save_path) if print_path else None
-
-                    np.save(save_path, radar_pc)
-
 
 if __name__ == "__main__":
-    # Fixes potential bug that causes work to conflict with shared memory access and crash
+    # Fixes potential bug that causes workers to conflict with shared memory access and crash
     # try: 
     #     mp.set_start_method("spawn", force=True)
     # except RuntimeError:
@@ -378,10 +409,8 @@ if __name__ == "__main__":
 
     # Force CUDA initialization
     if torch.cuda.is_available():
-        # torch.cuda.init()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        # torch.set_float32_matmul_precision('medium')
 
     params = data_preparation.get_default_params()
 
@@ -398,11 +427,6 @@ if __name__ == "__main__":
 
     checkpoint_path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet152/last-v1.ckpt'
 
-    # This train the NN
-    # main(params, resume_checkpoint=checkpoint_path)
-
-    # This generate the poincloud from the trained NN
-    generate_point_clouds(params)
-
-    # This compute the Pd, Pfa and Chamfer distance
-    compute_metrics_time(params)
+    # This trains the NN
+    main(params, resume_checkpoint=checkpoint_path)
+    # main(params)
