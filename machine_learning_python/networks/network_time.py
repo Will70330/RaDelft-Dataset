@@ -26,13 +26,29 @@ from pytorch_lightning.callbacks.progress.rich_progress import RichProgressBarTh
 from pytorch_lightning.callbacks import ModelCheckpoint
 import torchvision.models as models
 from utils.compute_metrics import compute_metrics_time, compute_pd_pfa
+import wandb
+
+# Start a new wandb run to track this script.
+run = wandb.init(
+    # Set the wandb entity where your project will be logged (generally your team name).
+    entity="will_70330",
+    # Set the wandb project where this run will be logged.
+    project="RISS-Research-Delft",
+    # Track hyperparameters and run metadata.
+    config={
+        "learning_rate": 0.001,
+        "architecture": "Custom-ResNet101",
+        "dataset": "RaDelft",
+        "epochs": 80,
+    },
+)
 
 OUT_CLASSES = 34  # 44 elevation angles
 IN_CHANNELS = 64  # output of the ReduceDNet
 
 # ToDO: Check if goes faster with this:
 torch.set_float32_matmul_precision('medium')
-mp.set_start_method("spawn", force=True)
+# mp.set_start_method("spawn", force=True)
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # this gets rid of the Doppler dimension to get a "2D image".
@@ -192,14 +208,15 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         loss = self.shared_step(batch, "train")
         actual_batch_size = batch[0].shape[0]
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=actual_batch_size, sync_dist=True)
+        run.log({'train_loss': loss.item(), 'lr': self.hparams.lr})
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss, pd, pfa = self.shared_step(batch, "valid")
-        
+        actual_batch_size = batch[0].shape[0]
         self.log_dict({'val_loss': loss, 'val_pd': pd, 'val_pfa': pfa, }, on_step=False, on_epoch=True, prog_bar=True,
-                      logger=True, batch_size=4)
-
+                      logger=True, batch_size=actual_batch_size)
+        run.log({'val_loss': loss.item(), 'val_pd': pd.item(), 'val_pfa': pfa.item(), 'lr': self.hparams.lr})
         return loss
 
     def test_step(self, batch, batch_idx):
@@ -216,6 +233,19 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
     #         for p in self.model.encoder.parameters():
     #             p.requires_grad_(True)
 
+    def on_after_backward(self):
+        # Log gradient norms
+        total_norm = 0
+        param_count = 0
+        for p in self.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.detach().data.norm(2)
+                total_norm += param_norm.item() ** 2
+                param_count += 1
+        total_norm = total_norm ** 0.5
+        self.log('grad_norm', total_norm, on_step=True, on_epoch=False)
+        run.log({"grad_norm": total_norm})
+
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(),
                                       lr=self.hparams.lr,
@@ -223,7 +253,8 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=5)
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=self.trainer.max_epochs - self.hparams.warmup_epochs
+            T_max=self.trainer.max_epochs - self.hparams.warmup_epochs,
+            eta_min=1e-6
         )
         scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer,
@@ -238,7 +269,8 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
             "scheduler": scheduler,
             "interval": "epoch",
             "frequency": 1,
-            "monitor": "val_loss",
+            "monitor": "train_loss_epoch",
+            # "monitor": "val_loss",
         }
         return {'optimizer': optimizer, 'lr_scheduler': scheduler}
                 # 'monitor': 'train_loss_epoch'}
@@ -252,10 +284,26 @@ def main(params, resume_checkpoint=None):
 
     # Create training and validation data loaders
     batch_size = 1
-    num_workers = 8
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
-    model = NeuralNetworkRadarDetector("FPN", "resnet101", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES, lr=3e-4)
+    num_workers = 10
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=num_workers, 
+        pin_memory=False,
+        # persistent_workers=True,
+        prefetch_factor=2
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers, 
+        pin_memory=False,
+        # persistent_workers=True,
+        prefetch_factor=1
+    )
+    model = NeuralNetworkRadarDetector("FPN", "resnet101", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES, lr=1e-4)
 
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
@@ -271,12 +319,12 @@ def main(params, resume_checkpoint=None):
         accelerator="gpu",
         strategy="ddp",         # We need this for multi-GPU since we want to sync BN
         sync_batchnorm=True,
-        devices=3,
+        devices=2,
         max_epochs=70,
-        precision="16-mixed",
+        # precision="16-mixed",
         accumulate_grad_batches=4,
         callbacks=[checkpoint_callback, RichProgressBar(leave=True, theme=RichProgressBarTheme(metrics_format='.4e'))],
-        gradient_clip_val=1.0,
+        gradient_clip_val=0.1,
     )
     trainer.fit(
         model,
@@ -284,6 +332,8 @@ def main(params, resume_checkpoint=None):
         val_dataloaders=val_loader,
         ckpt_path=resume_checkpoint
     )
+
+    run.finish()
 
 
 def generate_point_clouds(params, print_path=False):
@@ -351,10 +401,10 @@ if __name__ == "__main__":
     # This must be kept to false. If the network without elevation is needed, use network_noElevation.py instead
     params["bev"] = False
 
-    #checkpoint_path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet50/last.ckpt'
+    checkpoint_path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet101-optimized/model-epoch=12-val_loss=0.0005.ckpt'
 
     # This train the NN
-    main(params)
+    main(params, resume_checkpoint=checkpoint_path)
 
     # This generate the poincloud from the trained NN
     # generate_point_clouds(params)
