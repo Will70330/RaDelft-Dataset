@@ -92,13 +92,12 @@ class DopplerEncoder(nn.Module):
 
 class NeuralNetworkRadarDetector(pl.LightningModule):
 
-    def __init__(self, arch, encoder_name, params, in_channels, out_classes, lr=3e-4, warmup_epochs=10, use_groupNorm=False, alpha=1.0, **kwargs):
+    def __init__(self, arch, encoder_name, params, in_channels, out_classes, lr=3e-4, warmup_epochs=10, use_groupNorm=False, **kwargs):
         super().__init__()
         self.training_step_outputs = []
         self.validation_step_outputs = []
         self.save_hyperparameters()
         self.DopplerReducer = DopplerEncoder(use_groupNorm=use_groupNorm)
-        self.alpha = alpha
 
         self.model = smp.create_model(
             arch,
@@ -133,7 +132,8 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         self.relu5 = nn.ReLU()
         self.conv6 = nn.Conv3d(6, 3, kernel_size=kernel_size, padding='same')
 
-        self.dropout = nn.Dropout3d(p=0.3)  # Increased dropout for stronger regularization
+        self.dropout = nn.Dropout3d(p=0.2)  # Increased dropout for stronger regularization
+        self.temporal_mix = nn.Parameter(torch.tensor(0.3))  # Start with 10% temporal
 
         # Initialize temporal smoothing layers
         for m in [self.conv1, self.conv2, self.conv3, self.conv4, self.conv5, self.conv6]:
@@ -168,35 +168,37 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
 
         mask = torch.stack([mask1, mask2, mask3], 4)
         mask = torch.permute(mask, [0, 4, 1, 2, 3])
+        original_mask = mask.clone()
 
         # Temporal smoothing
         mask = self.conv1(mask)
         mask = self.relu1(mask)
-        mask = self.dropout(mask)
+        mask = self.dropout(mask) if self.training else mask
         mask = self.conv2(mask)
         mask = self.relu2(mask)
-        mask = self.dropout(mask)
+        mask = self.dropout(mask) if self.training else mask
         mask = self.conv3(mask)
         mask = self.relu3(mask)
-        mask = self.dropout(mask)
+        mask = self.dropout(mask) if self.training else mask
         mask = self.conv4(mask)
         mask = self.relu4(mask)
-        mask = self.dropout(mask)
+        mask = self.dropout(mask) if self.training else mask
         mask = self.conv5(mask)
         mask = self.relu5(mask)
-        mask = self.dropout(mask)
+        mask = self.dropout(mask) if self.training else mask
         mask = self.conv6(mask)
+
+        mask = torch.sigmoid(self.temporal_mix) * mask + (1 - torch.sigmoid(self.temporal_mix)) * original_mask
 
         return mask
 
     def shared_step(self, batch, stage):
         # Load input and GT
         RAD_cube = batch[0]  # range azimuth doppler cube, the input to the network
-        gt_lidar_cube = batch[1]  # TODO here we have to get the gt_cloud and convert it to a mask that fits our loss
-        # item_params = batch[2]
+        gt_lidar_cube = batch[1]  # ground truth lidar cube
 
         # Run the network
-        RAE_Cube = self.forward(RAD_cube)  # output is a binary dense mask of the cube in RAE format: range, azimuth, elevation
+        RAE_Cube = self.forward(RAD_cube)  # output is a binary dense mask of the cube in RAE format
 
         loss = data_preparation.radarcube_lidarcube_loss_time(RAE_Cube, gt_lidar_cube, self.params)
 
@@ -206,13 +208,43 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         loss = loss + l1_lambda * l1_reg
 
         if stage == 'valid':
-            radar_cube_out = RAE_Cube.sigmoid().squeeze().cpu().detach().numpy()
-            radar_cube_out = radar_cube_out > 0.5
+            # Detach early to save memory
+            radar_cube_out = RAE_Cube.sigmoid().detach()
+
+            sigmoid_vals = radar_cube_out.flatten()
+            print(f"Predictions > 0.3: {(sigmoid_vals > 0.3).sum()}")
+            print(f"Predictions > 0.4: {(sigmoid_vals > 0.4).sum()}")
+            print(f"Predictions > 0.5: {(sigmoid_vals > 0.5).sum()}")
+            print(f"Predictions > 0.6: {(sigmoid_vals > 0.6).sum()}")
+            
+            # Debug prints - remove after fixing
+            if self.counter % 10 == 0:  # Print every 10th validation step
+                print(f"\n=== Validation Debug (step {self.counter}) ===")
+                print(f"RAE_Cube shape: {RAE_Cube.shape}")
+                print(f"RAE_Cube min/max before sigmoid: {RAE_Cube.min().item():.4f} / {RAE_Cube.max().item():.4f}")
+                print(f"After sigmoid min/max: {radar_cube_out.min().item():.4f} / {radar_cube_out.max().item():.4f}")
+                print(f"GT lidar shape: {gt_lidar_cube.shape}")
+                print(f"GT lidar unique values: {torch.unique(gt_lidar_cube)}")
+                print(f"GT lidar sum: {gt_lidar_cube.sum().item()}")
+            self.counter += 1
+            
+            # Convert to numpy and threshold
+            radar_cube_out = (radar_cube_out > 0.5).cpu().numpy()
+            
+            # Apply slicing
             if radar_cube_out.ndim == 5:
                 radar_cube_out = radar_cube_out[:, :, :, :-12, 8:-8]
             else:
                 radar_cube_out = radar_cube_out[:, :, :-12, 8:-8]
-            pd, pfa = compute_pd_pfa(gt_lidar_cube.cpu().detach().numpy(), radar_cube_out)
+                
+            # More debug info
+            if self.counter % 10 == 1:  # Right after the previous print
+                print(f"After slicing shape: {radar_cube_out.shape}")
+                print(f"Radar predictions sum: {radar_cube_out.sum()}")
+                print(f"Radar predictions mean: {radar_cube_out.mean():.6f}")
+                print("=====================================\n")
+                
+            pd, pfa = compute_pd_pfa(gt_lidar_cube.cpu().numpy(), radar_cube_out)
 
             return loss, pd, pfa
 
@@ -320,7 +352,7 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
 def main(params, resume_checkpoint=None):
     # Start a new wandb run to track this script.
     global run
-    checkpointt_directory = "checkpoints-resnet152"
+    checkpointt_directory = "checkpoints-resnet101"
     if resume_checkpoint:
         ckpt_dir = os.path.dirname(resume_checkpoint)
     else: 
@@ -335,7 +367,7 @@ def main(params, resume_checkpoint=None):
             entity="will_70330",
             project="RISS-Research-RaDelft",
             config={
-                "architecture": "ResNet152-regularized-deep-temporal",
+                "architecture": "ResNet101-regularized-deep-temporal",
                 "dataset": "RaDelft",
                 "epochs": 80,
             },
@@ -348,7 +380,7 @@ def main(params, resume_checkpoint=None):
             entity="will_70330",
             project="RISS-Research-RaDelft",
             config={
-                "architecture": "ResNet152-regularized-deep-temporal",
+                "architecture": "ResNet101-regularized-deep-temporal",
                 "dataset": "RaDelft",
                 "epochs": 80,
             }
@@ -363,11 +395,11 @@ def main(params, resume_checkpoint=None):
     val_dataset = RADCUBE_DATASET_TIME(mode='val', params=params)
 
     # Create training and validation data loaders
-    batch_size = 2  # Limited by GPU memory
-    num_workers = 5 # Limited by CPU
+    batch_size = 1  # Limited by GPU memory
+    num_workers = 6 # Limited by CPU
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False, prefetch_factor=1)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
-    model = NeuralNetworkRadarDetector("FPN", "resnet152", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES, lr=1e-4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False, prefetch_factor=1)
+    model = NeuralNetworkRadarDetector("FPN", "resnet101", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES, lr=1e-4, use_groupNorm=True)
 
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
@@ -381,9 +413,9 @@ def main(params, resume_checkpoint=None):
 
     trainer = pl.Trainer(
         accelerator="gpu",
-        strategy="auto",         # We need this for multi-GPU / High Accumulated Batches since we want to sync BN
+        strategy="ddp",         # We need this for multi-GPU / High Accumulated Batches since we want to sync BN
         sync_batchnorm=True,
-        devices=1,
+        devices=2,
         max_epochs=80,
         precision="16-mixed",
         accumulate_grad_batches=4,
@@ -401,12 +433,6 @@ def main(params, resume_checkpoint=None):
 
 
 if __name__ == "__main__":
-    # Fixes potential bug that causes workers to conflict with shared memory access and crash
-    # try: 
-    #     mp.set_start_method("spawn", force=True)
-    # except RuntimeError:
-    #     pass # Already Set
-
     # Force CUDA initialization
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -415,7 +441,7 @@ if __name__ == "__main__":
     params = data_preparation.get_default_params()
 
     # Initialise parameters
-    params["dataset_path"] = '/media/muckelroyiii/ExtremePro/RaDelft/'
+    params["dataset_path"] = '/media/muckelroyiii/Crucial-SSD/RaDelft/'
     params["train_val_scenes"] = [1,3,4,5,7]
     params["test_scenes"] = [2,6]
     params["train_test_split_percent"] = 0.8
@@ -428,5 +454,5 @@ if __name__ == "__main__":
     checkpoint_path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet152/last-v1.ckpt'
 
     # This trains the NN
-    main(params, resume_checkpoint=checkpoint_path)
-    # main(params)
+    # main(params, resume_checkpoint=checkpoint_path)
+    main(params)
