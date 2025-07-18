@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 # add parent directory to path
 import sys
 
+import torch.utils.checkpoint
+
 # apend the absolute path of the parent directory
 sys.path.append(sys.path[0] + "/..")
 import scipy.io
@@ -28,20 +30,7 @@ import torchvision.models as models
 from utils.compute_metrics import compute_metrics_time, compute_pd_pfa
 import wandb
 
-# Start a new wandb run to track this script.
-run = wandb.init(
-    # Set the wandb entity where your project will be logged (generally your team name).
-    entity="will_70330",
-    # Set the wandb project where this run will be logged.
-    project="RISS-Research-Delft",
-    # Track hyperparameters and run metadata.
-    config={
-        "learning_rate": 0.001,
-        "architecture": "Custom-ResNet101",
-        "dataset": "RaDelft",
-        "epochs": 80,
-    },
-)
+run = None
 
 OUT_CLASSES = 34  # 44 elevation angles
 IN_CHANNELS = 64  # output of the ReduceDNet
@@ -54,7 +43,7 @@ torch.set_float32_matmul_precision('medium')
 # this gets rid of the Doppler dimension to get a "2D image".
 # We go from B*C*D*H*W to B*C*H*W, H and W are ranges and azimuths
 class DopplerEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, use_groupNorm=False):
         super(DopplerEncoder, self).__init__()
 
         # Parameters
@@ -73,14 +62,12 @@ class DopplerEncoder(nn.Module):
 
         # Step 1: Convolution parameters to reduce from 240 to 60
         self.conv1 = nn.Conv3d(in_channels, out_channel_1, kernel_size=kernel_size1, stride=stride1, padding=padding1)
-        self.norm1 = nn.GroupNorm(num_groups=8, num_channels=32)
-        # self.norm1 = nn.BatchNorm3d(32)
+        self.norm1 = nn.BatchNorm3d(32) if not use_groupNorm else nn.GroupNorm(num_groups=8, num_channels=32)
         self.relu1 = nn.ReLU()
 
         # Step 2: Convolution parameters to reduce from 60 to 15
         self.conv2 = nn.Conv3d(out_channel_1, out_channel_2, kernel_size=kernel_size2, stride=stride2, padding=padding2)
-        self.norm2 = nn.GroupNorm(num_groups=8, num_channels=64)
-        # self.norm2 = nn.BatchNorm3d(64)
+        self.norm2 = nn.BatchNorm3d(64) if not use_groupNorm else nn.GroupNorm(num_groups=8, num_channels=64)
         self.relu2 = nn.ReLU()
 
         # Step 3: Pooling parameters to reduce from 15 to 1
@@ -105,12 +92,12 @@ class DopplerEncoder(nn.Module):
 
 class NeuralNetworkRadarDetector(pl.LightningModule):
 
-    def __init__(self, arch, encoder_name, params, in_channels, out_classes, lr=3e-4, warmup_epochs=5, **kwargs):
+    def __init__(self, arch, encoder_name, params, in_channels, out_classes, lr=3e-4, warmup_epochs=10, use_groupNorm=False, **kwargs):
         super().__init__()
         self.training_step_outputs = []
         self.validation_step_outputs = []
         self.save_hyperparameters()
-        self.DopplerReducer = DopplerEncoder()
+        self.DopplerReducer = DopplerEncoder(use_groupNorm=use_groupNorm)
 
         self.model = smp.create_model(
             arch,
@@ -125,19 +112,38 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         # see the *world-size* batch, not the 1–2 samples on each GPU.
         self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
 
-        # enabling gradient checkpointing for Resnet50
-        if encoder_name == "resnet101" and hasattr(self.model.encoder, 'model'):
-            self.model.encoder.model.set_grad_checkpointing(True)
+        # # Convert every BN inside the ResNet to SyncBN so BN layers
+        # # see the *world-size* batch, not the 1–2 samples on each GPU.
+        # self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
 
+        # Enable gradient checkpointing for memory efficiency (optional)
+        # Only use if you're running out of memory
+        # self._enable_gradient_checkpointing()
+
+
+        # Temporal smoothing layers
         kernel_size = (3, 5, 7)
 
         self.conv1 = nn.Conv3d(3, 6, kernel_size=kernel_size, padding='same')
         self.relu1 = nn.ReLU()
         self.conv2 = nn.Conv3d(6, 12, kernel_size=kernel_size, padding='same')
         self.relu2 = nn.ReLU()
-        self.conv3 = nn.Conv3d(12, 6, kernel_size=kernel_size, padding='same')
+        self.conv3 = nn.Conv3d(12, 24, kernel_size=kernel_size, padding='same')
         self.relu3 = nn.ReLU()
-        self.conv4 = nn.Conv3d(6, 3, kernel_size=kernel_size, padding='same')
+        self.conv4 = nn.Conv3d(24, 12, kernel_size=kernel_size, padding='same')
+        self.relu4 = nn.ReLU()
+        self.conv5 = nn.Conv3d(12, 6, kernel_size=kernel_size, padding='same')
+        self.relu5 = nn.ReLU()
+        self.conv6 = nn.Conv3d(6, 3, kernel_size=kernel_size, padding='same')
+
+        self.dropout = nn.Dropout3d(p=0.2)  # Increased dropout for stronger regularization
+        self.temporal_mix = nn.Parameter(torch.tensor(0.3))  # Start with 10% temporal
+
+        # Initialize temporal smoothing layers
+        for m in [self.conv1, self.conv2, self.conv3, self.conv4, self.conv5, self.conv6]:
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
         self.counter = 0
         self.params = params
@@ -165,40 +171,84 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         mask3 = self.model(image3)
 
         mask = torch.stack([mask1, mask2, mask3], 4)
-
         mask = torch.permute(mask, [0, 4, 1, 2, 3])
+        original_mask = mask.clone()
 
         # Temporal smoothing
         mask = self.conv1(mask)
         mask = self.relu1(mask)
+        mask = self.dropout(mask) if self.training else mask
         mask = self.conv2(mask)
         mask = self.relu2(mask)
+        mask = self.dropout(mask) if self.training else mask
         mask = self.conv3(mask)
         mask = self.relu3(mask)
+        mask = self.dropout(mask) if self.training else mask
         mask = self.conv4(mask)
+        mask = self.relu4(mask)
+        mask = self.dropout(mask) if self.training else mask
+        mask = self.conv5(mask)
+        mask = self.relu5(mask)
+        mask = self.dropout(mask) if self.training else mask
+        mask = self.conv6(mask)
+
+        mask = torch.sigmoid(self.temporal_mix) * mask + (1 - torch.sigmoid(self.temporal_mix)) * original_mask
 
         return mask
 
     def shared_step(self, batch, stage):
         # Load input and GT
         RAD_cube = batch[0]  # range azimuth doppler cube, the input to the network
-        gt_lidar_cube = batch[1]  # TODO here we have to get the gt_cloud and convert it to a mask that fits our loss
-        # item_params = batch[2]
+        gt_lidar_cube = batch[1]  # ground truth lidar cube
 
         # Run the network
-        RAE_Cube = self.forward(
-            RAD_cube)  # output is a binary dense mask of the cube in RAE format: range, azimuth, elevation
+        RAE_Cube = self.forward(RAD_cube)  # output is a binary dense mask of the cube in RAE format
 
         loss = data_preparation.radarcube_lidarcube_loss_time(RAE_Cube, gt_lidar_cube, self.params)
 
+        # Add L1 regularization for additional control over overfitting
+        l1_lambda = 1e-5
+        l1_reg = sum(p.abs().sum() for p in self.parameters() if p.requires_grad)
+        loss = loss + l1_lambda * l1_reg
+
         if stage == 'valid':
-            radar_cube_out = RAE_Cube.sigmoid().squeeze().cpu().detach().numpy()
-            radar_cube_out = radar_cube_out > 0.5
+            # Detach early to save memory
+            radar_cube_out = RAE_Cube.sigmoid().detach()
+
+            sigmoid_vals = radar_cube_out.flatten()
+            print(f"Predictions > 0.3: {(sigmoid_vals > 0.3).sum()}")
+            print(f"Predictions > 0.4: {(sigmoid_vals > 0.4).sum()}")
+            print(f"Predictions > 0.5: {(sigmoid_vals > 0.5).sum()}")
+            print(f"Predictions > 0.6: {(sigmoid_vals > 0.6).sum()}")
+            
+            # Debug prints - remove after fixing
+            if self.counter % 10 == 0:  # Print every 10th validation step
+                print(f"\n=== Validation Debug (step {self.counter}) ===")
+                print(f"RAE_Cube shape: {RAE_Cube.shape}")
+                print(f"RAE_Cube min/max before sigmoid: {RAE_Cube.min().item():.4f} / {RAE_Cube.max().item():.4f}")
+                print(f"After sigmoid min/max: {radar_cube_out.min().item():.4f} / {radar_cube_out.max().item():.4f}")
+                print(f"GT lidar shape: {gt_lidar_cube.shape}")
+                print(f"GT lidar unique values: {torch.unique(gt_lidar_cube)}")
+                print(f"GT lidar sum: {gt_lidar_cube.sum().item()}")
+            self.counter += 1
+            
+            # Convert to numpy and threshold
+            radar_cube_out = (radar_cube_out > 0.5).cpu().numpy()
+            
+            # Apply slicing
             if radar_cube_out.ndim == 5:
                 radar_cube_out = radar_cube_out[:, :, :, :-12, 8:-8]
             else:
                 radar_cube_out = radar_cube_out[:, :, :-12, 8:-8]
-            pd, pfa = compute_pd_pfa(gt_lidar_cube.cpu().detach().numpy(), radar_cube_out)
+                
+            # More debug info
+            if self.counter % 10 == 1:  # Right after the previous print
+                print(f"After slicing shape: {radar_cube_out.shape}")
+                print(f"Radar predictions sum: {radar_cube_out.sum()}")
+                print(f"Radar predictions mean: {radar_cube_out.mean():.6f}")
+                print("=====================================\n")
+                
+            pd, pfa = compute_pd_pfa(gt_lidar_cube.cpu().numpy(), radar_cube_out)
 
             return loss, pd, pfa
 
@@ -206,32 +256,31 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss = self.shared_step(batch, "train")
-        actual_batch_size = batch[0].shape[0]
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=actual_batch_size, sync_dist=True)
-        run.log({'train_loss': loss.item(), 'lr': self.hparams.lr})
+        actual_batch_size = batch[0].shape[0] # This should be 1 / 2
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=actual_batch_size)
+        
+        # Log to wandb less frequently to reduce overhead
+        if batch_idx % 10 == 0:
+            run.log({'train_loss': loss.item(), 'lr': self.optimizers().param_groups[0]['lr']})
+        
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss, pd, pfa = self.shared_step(batch, "valid")
-        actual_batch_size = batch[0].shape[0]
-        self.log_dict({'val_loss': loss, 'val_pd': pd, 'val_pfa': pfa, }, on_step=False, on_epoch=True, prog_bar=True,
+        
+        actual_batch_size = batch[0].shape[0] # This should be 1 / 2
+        self.log_dict({'val_loss': loss, 'val_pd': pd, 'val_pfa': pfa, },
+                      on_step=False, on_epoch=True, prog_bar=True,
                       logger=True, batch_size=actual_batch_size)
-        run.log({'val_loss': loss.item(), 'val_pd': pd.item(), 'val_pfa': pfa.item(), 'lr': self.hparams.lr})
+        
+        # Log to wandb less frequently to reduce overhead
+        if batch_idx % 10 == 0:
+            run.log({'val_loss': loss.item(), 'val_pd': pd.item(), 'val_pfa': pfa.item(), 'lr': self.hparams.lr})
+        
         return loss
 
     def test_step(self, batch, batch_idx):
         return self.shared_step(batch, "test")
-    
-    # def on_train_start(self):
-    #     # freeze for the first 5 epochs
-    #     if self.current_epoch == 0:
-    #         for p in self.model.encoder.parameters():
-    #             p.requires_grad_(False)
-
-    # def on_train_epoch_end(self):
-    #     if self.current_epoch == 4:        # un-freeze after warm-up
-    #         for p in self.model.encoder.parameters():
-    #             p.requires_grad_(True)
 
     def on_after_backward(self):
         # Log gradient norms
@@ -244,70 +293,121 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
                 param_count += 1
         total_norm = total_norm ** 0.5
         self.log('grad_norm', total_norm, on_step=True, on_epoch=False)
-        run.log({"grad_norm": total_norm})
+        
+        # Log to wandb less frequently
+        if self.global_step % 10 == 0:
+            run.log({"grad_norm": total_norm})
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(),
                                       lr=self.hparams.lr,
-                                      weight_decay=1e-4)
-        warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=5)
-        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.trainer.max_epochs - self.hparams.warmup_epochs,
-            eta_min=1e-6
+                                      weight_decay=1e-4)  # Increased weight decay for stronger L2 regularization
+
+        # Warmup scheduler - crucial for stable training with batch_size=1
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, 
+            start_factor=0.01,  # Start at 1% of target LR (more conservative than 0.005)
+            total_iters=self.hparams.warmup_epochs
         )
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
+        
+        # Cosine annealing with warm restarts
+        cosine = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=10,      # First restart after 10 epochs
+            T_mult=2,    # Double the period after each restart (10, 20, 40, ...)
+            eta_min=1e-7 # Minimum learning rate
+        )
+        
+        # Combine warmup and cosine schedules
+        base_scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer,
             schedulers=[warmup, cosine],
-            milestones=[5]
+            milestones=[self.hparams.warmup_epochs]
         )
+        
+        # Add ReduceLROnPlateau on top for additional adaptation
+        plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.7,      # Less aggressive reduction since we have cosine
+            patience=8,      # Higher patience to let cosine schedule work
+            verbose=True,
+            min_lr=1e-8      # Lower than cosine min_lr
+        )
+
         # optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
         # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=1)
 
-        # manual warmup
-        scheduler = {
-            "scheduler": scheduler,
-            "interval": "epoch",
-            "frequency": 1,
-            "monitor": "train_loss_epoch",
-            # "monitor": "val_loss",
-        }
-        return {'optimizer': optimizer, 'lr_scheduler': scheduler}
-                # 'monitor': 'train_loss_epoch'}
+        # Return both schedulers - PyTorch Lightning will handle them correctly
+        return [optimizer], [
+            {
+                'scheduler': base_scheduler
+            }, 
+            {
+                'scheduler': plateau_scheduler,
+                'monitor': 'val_loss',
+                'interval': 'epoch',
+                'frequency': 1
+            }      
+        ]
 
 
 # main function
 def main(params, resume_checkpoint=None):
+    # Start a new wandb run to track this script.
+    global run
+    checkpointt_directory = "checkpoints-resnet101"
+    if resume_checkpoint:
+        ckpt_dir = os.path.dirname(resume_checkpoint)
+    else: 
+        ckpt_dir = checkpointt_directory
+        
+    run_id_file = os.path.join(ckpt_dir, "wandb_run_id.txt")
+    if resume_checkpoint and os.path.exists(run_id_file):
+        # Load old run ID and re-attach
+        with open(run_id_file, "r") as f:
+            old_id = f.read().strip()
+        run = wandb.init(
+            entity="will_70330",
+            project="RISS-Research-RaDelft",
+            config={
+                "architecture": "ResNet101-regularized-deep-temporal",
+                "dataset": "RaDelft",
+                "epochs": 80,
+            },
+            id=old_id,
+            resume="allow"
+        )
+    else:
+        # Brand new run
+        run = wandb.init(
+            entity="will_70330",
+            project="RISS-Research-RaDelft",
+            config={
+                "architecture": "ResNet101-regularized-deep-temporal",
+                "dataset": "RaDelft",
+                "epochs": 80,
+            }
+        )
+        # check for exisiting checkpoint folder and write run ID
+        os.makedirs(ckpt_dir, exist_ok=True)
+        with open(run_id_file, 'w') as f:
+            f.write(run.id)
+
     # Create training and validation datasets
     train_dataset = RADCUBE_DATASET_TIME(mode='train', params=params)
     val_dataset = RADCUBE_DATASET_TIME(mode='val', params=params)
 
     # Create training and validation data loaders
-    batch_size = 1
-    num_workers = 10
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=num_workers, 
-        pin_memory=False,
-        # persistent_workers=True,
-        prefetch_factor=2
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=num_workers, 
-        pin_memory=False,
-        # persistent_workers=True,
-        prefetch_factor=1
-    )
-    model = NeuralNetworkRadarDetector("FPN", "resnet101", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES, lr=1e-4)
+    batch_size = 1  # Limited by GPU memory
+    num_workers = 6 # Limited by CPU
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False, prefetch_factor=1)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False, prefetch_factor=1)
+    model = NeuralNetworkRadarDetector("FPN", "resnet101", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES, lr=1e-4, use_groupNorm=True)
 
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
-        dirpath="checkpoints-resnet101-optimized",
+        dirpath=checkpointt_directory,
         filename="model-{epoch:02d}-{val_loss:.4f}",
         save_top_k=3,   # keep best 3 models
         mode="min",     # because we're minimizing loss
@@ -317,14 +417,14 @@ def main(params, resume_checkpoint=None):
 
     trainer = pl.Trainer(
         accelerator="gpu",
-        strategy="ddp",         # We need this for multi-GPU since we want to sync BN
+        strategy="ddp",         # We need this for multi-GPU / High Accumulated Batches since we want to sync BN
         sync_batchnorm=True,
         devices=2,
-        max_epochs=70,
-        # precision="16-mixed",
+        max_epochs=80,
+        precision="16-mixed",
         accumulate_grad_batches=4,
         callbacks=[checkpoint_callback, RichProgressBar(leave=True, theme=RichProgressBarTheme(metrics_format='.4e'))],
-        gradient_clip_val=0.1,
+        gradient_clip_val=0.2,
     )
     trainer.fit(
         model,
@@ -336,57 +436,11 @@ def main(params, resume_checkpoint=None):
     run.finish()
 
 
-def generate_point_clouds(params, print_path=False):
-    # Load model
-    path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet101/model-epoch=04-val_loss=0.0009.ckpt'
-    checkpoint = torch.load(path)
-    model = NeuralNetworkRadarDetector("FPN", "resnet101", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
-    model.load_state_dict(checkpoint['state_dict'])
-    model.eval()
-
-    # Create Loader
-    val_dataset = RADCUBE_DATASET_TIME(mode='test', params=params)
-
-    # Create training and validation data loaders
-    num_workers = 10
-    val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=num_workers, pin_memory=False)
-
-    for batch in tqdm(val_loader, desc="generating point clouds", unit="batch(s)"):
-
-        radar_cube, lidar_cube, data_dict = batch
-
-        with torch.no_grad():
-            output = model(radar_cube)
-            for i in range(lidar_cube.shape[0]):
-                for t in range(lidar_cube.shape[1]):
-                    output_t = output[i, t, :, :, :]
-                    data_dict_t = data_dict[t]
-
-                    radar_pc = data_preparation.cube_to_pointcloud(output_t, params, radar_cube[i, t, :, :, :], 'radar')
-
-                    radar_pc[:, 2] = -radar_pc[:, 2]
-
-                    cfar_path = data_dict_t["cfar_path"][i]
-                    save_path = re.sub(r"radar_.+/", r"network/", cfar_path)
-                    print(save_path) if print_path else None
-                    # print(save_path)
-
-                    np.save(save_path, radar_pc)
-
-
 if __name__ == "__main__":
-    # Fixes potential bug that causes work to conflict with shared memory access and crash
-    # try: 
-    #     mp.set_start_method("spawn", force=True)
-    # except RuntimeError:
-    #     pass # Already Set
-
     # Force CUDA initialization
     if torch.cuda.is_available():
-        # torch.cuda.init()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        torch.set_float32_matmul_precision('medium')
 
     params = data_preparation.get_default_params()
 
@@ -401,13 +455,8 @@ if __name__ == "__main__":
     # This must be kept to false. If the network without elevation is needed, use network_noElevation.py instead
     params["bev"] = False
 
-    checkpoint_path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet101-optimized/model-epoch=12-val_loss=0.0005.ckpt'
+    checkpoint_path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet152/last-v1.ckpt'
 
-    # This train the NN
-    main(params, resume_checkpoint=checkpoint_path)
-
-    # This generate the poincloud from the trained NN
-    # generate_point_clouds(params)
-
-    # This compute the Pd, Pfa and Chamfer distance
-    # compute_metrics_time(params)
+    # This trains the NN
+    # main(params, resume_checkpoint=checkpoint_path)
+    main(params)
