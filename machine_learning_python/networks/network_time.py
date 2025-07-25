@@ -130,19 +130,19 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         self.relu1 = nn.ReLU()
         self.conv2 = nn.Conv3d(6, 12, kernel_size=kernel_size, padding='same')
         self.relu2 = nn.ReLU()
-        self.conv3 = nn.Conv3d(12, 24, kernel_size=kernel_size, padding='same')
+        self.conv3 = nn.Conv3d(12, 6, kernel_size=kernel_size, padding='same')
         self.relu3 = nn.ReLU()
-        self.conv4 = nn.Conv3d(24, 12, kernel_size=kernel_size, padding='same')
-        self.relu4 = nn.ReLU()
-        self.conv5 = nn.Conv3d(12, 6, kernel_size=kernel_size, padding='same')
-        self.relu5 = nn.ReLU()
-        self.conv6 = nn.Conv3d(6, 3, kernel_size=kernel_size, padding='same')
+        self.conv4 = nn.Conv3d(6, 3, kernel_size=kernel_size, padding='same')
+        # self.relu4 = nn.ReLU()
+        # self.conv5 = nn.Conv3d(12, 6, kernel_size=kernel_size, padding='same')
+        # self.relu5 = nn.ReLU()
+        # self.conv6 = nn.Conv3d(6, 3, kernel_size=kernel_size, padding='same')
 
-        self.dropout = nn.Dropout3d(p=0.2)  # Increased dropout for stronger regularization
-        self.temporal_mix = nn.Parameter(torch.tensor(0.3))  # Start with 30% temporal
+        self.dropout = nn.Dropout3d(p=0.1)  # Increased dropout for stronger regularization
+        self.temporal_mix = nn.Parameter(torch.tensor(0.85))  # Start with 85% temporal
 
         # Initialize temporal smoothing layers
-        for m in [self.conv1, self.conv2, self.conv3, self.conv4, self.conv5, self.conv6]:
+        for m in [self.conv1, self.conv2, self.conv3, self.conv4]:
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
@@ -187,17 +187,17 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         mask = self.relu3(mask)
         mask = self.dropout(mask) if self.training else mask
         mask = self.conv4(mask)
-        mask = self.relu4(mask)
-        mask = self.dropout(mask) if self.training else mask
-        mask = self.conv5(mask)
-        mask = self.relu5(mask)
-        mask = self.dropout(mask) if self.training else mask
-        mask = self.conv6(mask)
+        # mask = self.relu4(mask)
+        # mask = self.dropout(mask) if self.training else mask
+        # mask = self.conv5(mask)
+        # mask = self.relu5(mask)
+        # mask = self.dropout(mask) if self.training else mask
+        # mask = self.conv6(mask)
 
-        mask = (
-            torch.sigmoid(self.temporal_mix) * mask + 
-            (1 - torch.sigmoid(self.temporal_mix)) * original_mask
-        )
+        # mask = (
+        #     torch.sigmoid(self.temporal_mix) * mask + 
+        #     (1 - torch.sigmoid(self.temporal_mix)) * original_mask
+        # )
 
         return mask
 
@@ -264,7 +264,7 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         
         # Log to wandb less frequently to reduce overhead
         if batch_idx % 10 == 0:
-            run.log({'train_loss': loss.item(), 'lr': self.optimizers().param_groups[0]['lr']})
+            run.log({'train_loss': loss.item(), 'lr': self.optimizers().param_groups[0]['lr'], 'temporal_mix': torch.sigmoid(self.temporal_mix).item()})
         
         return loss
 
@@ -278,7 +278,7 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         
         # Log to wandb less frequently to reduce overhead
         if batch_idx % 10 == 0:
-            run.log({'val_loss': loss.item(), 'val_pd': pd.item(), 'val_pfa': pfa.item(), 'lr': self.hparams.lr})
+            run.log({'val_loss': loss.item(), 'val_pd': pd.item(), 'val_pfa': pfa.item(), 'lr': self.hparams.lr, 'temporal_mix': torch.sigmoid(self.temporal_mix).item()})
         
         return loss
 
@@ -310,7 +310,7 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         warmup = torch.optim.lr_scheduler.LinearLR(
             optimizer, 
             start_factor=0.01,  # Start at 1% of target LR (more conservative than 0.005)
-            total_iters=self.hparams.warmup_epochs
+            total_iters=5
         )
         
         # Cosine annealing with warm restarts
@@ -318,24 +318,24 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
             optimizer,
             T_0=10,      # First restart after 10 epochs
             T_mult=2,    # Double the period after each restart (10, 20, 40, ...)
-            eta_min=1e-7 # Minimum learning rate
+            eta_min=1e-8 # Minimum learning rate
         )
         
         # Combine warmup and cosine schedules
         base_scheduler = torch.optim.lr_scheduler.SequentialLR(
             optimizer,
             schedulers=[warmup, cosine],
-            milestones=[self.hparams.warmup_epochs]
+            milestones=[5]
         )
         
         # Add ReduceLROnPlateau on top for additional adaptation
         plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
-            factor=0.7,      # Less aggressive reduction since we have cosine
+            factor=0.5,      # Less aggressive reduction since we have cosine
             patience=8,      # Higher patience to let cosine schedule work
             verbose=True,
-            min_lr=1e-8      # Lower than cosine min_lr
+            min_lr=5e-9      # Lower than cosine min_lr
         )
 
         # optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
@@ -356,10 +356,10 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
 
 
 # main function
-def main(params, resume_checkpoint=None):
+def main(params, resume_checkpoint=None, debug=False):
     # Start a new wandb run to track this script.
     global run
-    checkpointt_directory = "checkpoints-resnet152"
+    checkpointt_directory = "checkpoints-resnet50-t4-new"
     if resume_checkpoint:
         ckpt_dir = os.path.dirname(resume_checkpoint)
     else: 
@@ -374,9 +374,9 @@ def main(params, resume_checkpoint=None):
             entity="will_70330",
             project="RISS-Research-RaDelft",
             config={
-                "architecture": "ResNet152-regularized-deep-temporal",
+                "architecture": "ResNet50-regularized-t4-new",
                 "dataset": "RaDelft",
-                "epochs": 80,
+                "epochs": 45,
             },
             id=old_id,
             resume="allow"
@@ -387,9 +387,9 @@ def main(params, resume_checkpoint=None):
             entity="will_70330",
             project="RISS-Research-RaDelft",
             config={
-                "architecture": "ResNet152-regularized-deep-temporal",
+                "architecture": "ResNet50-regularized-t4-new",
                 "dataset": "RaDelft",
-                "epochs": 80,
+                "epochs": 45,
             }
         )
         # check for exisiting checkpoint folder and write run ID
@@ -402,17 +402,17 @@ def main(params, resume_checkpoint=None):
     val_dataset = RADCUBE_DATASET_TIME(mode='val', params=params)
 
     # Create training and validation data loaders
-    batch_size = 1  # Limited by GPU memory
-    num_workers = 7 # Limited by CPU
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False, prefetch_factor=2)
+    batch_size = 2  # Limited by GPU memory
+    num_workers = 8 # Limited by CPU
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False, prefetch_factor=1)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False, prefetch_factor=1)
-    model = NeuralNetworkRadarDetector("FPN", "resnet152", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES, lr=1e-4, debug=True, use_groupNorm=True)
+    model = NeuralNetworkRadarDetector("FPN", "resnet50", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES, lr=1e-4, debug=debug, use_groupNorm=False)
 
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
         dirpath=checkpointt_directory,
-        filename="model-{epoch:02d}-{val_loss:.4f}",
-        save_top_k=3,   # keep best 3 models
+        filename="resnet50-t4-new-{epoch:02d}-{val_loss:.4f}",
+        save_top_k=5,   # keep best 3 models
         mode="min",     # because we're minimizing loss
         save_last=True, # always save the last checkpoint
         verbose=True,
@@ -423,9 +423,9 @@ def main(params, resume_checkpoint=None):
         strategy="auto",         # We need this for multi-GPU / High Accumulated Batches since we want to sync BN
         sync_batchnorm=True,
         devices=1,
-        max_epochs=80,
+        max_epochs=45,
         precision="16-mixed",
-        accumulate_grad_batches=8,
+        accumulate_grad_batches=4,
         callbacks=[checkpoint_callback, RichProgressBar(leave=True, theme=RichProgressBarTheme(metrics_format='.4e'))],
         gradient_clip_val=0.2,
     )
@@ -464,8 +464,8 @@ if __name__ == "__main__":
     # This must be kept to false. If the network without elevation is needed, use network_noElevation.py instead
     params["bev"] = False
 
-    checkpoint_path = '/home/muckelroyiii/Desktop/RISS_Research/checkpoints-resnet152/last-v1.ckpt'
+    checkpoint_path = ''
 
     # This trains the NN
     # main(params, resume_checkpoint=checkpoint_path)
-    main(params)
+    main(params, debug=False)
