@@ -375,6 +375,7 @@ class RADCUBE_DATASET_TIME(Dataset):
                 input_cube = power
             # load gt
             gt_cloud = data_preparation.read_pointcloud(self.data_dict[idx][index]["gt_path"], mode="rs_lidar_clean")
+            # print(f"Dataloader GT path: {self.data_dict[idx][index]["gt_path"]}")
 
             item_params = self.data_dict[idx][index]  # this is a dictionary with all the paths and timestamps
             gt_cube = data_preparation.lidarpc_to_lidarcube(gt_cloud, self.params)
