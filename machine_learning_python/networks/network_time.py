@@ -155,15 +155,15 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         )
 
         # Temporal smoothing layers (Dilated + Residuals)
-        self.block1 = ResidualConv3D(3, 6, 12, d1=(1,1,1), d2=(1,1,1), p_drop=self.p_drop)
-        self.block2 = ResidualConv3D(12, 24, 12, d1=(1,2,2), d2=(1,1,1), p_drop=self.p_drop)
-        self.block3 = ResidualConv3D(12, 6, 3, d1=(1,1,1), d2=(1,2,2), p_drop=self.p_drop)
+        # self.block1 = ResidualConv3D(3, 6, 12, d1=(1,1,1), d2=(1,1,1), p_drop=self.p_drop)
+        # self.block2 = ResidualConv3D(12, 24, 12, d1=(1,2,2), d2=(1,1,1), p_drop=self.p_drop)
+        # self.block3 = ResidualConv3D(12, 6, 3, d1=(1,1,1), d2=(1,2,2), p_drop=self.p_drop)
         
-        # kernel_size = (3, 5, 7)
+        kernel_size = (3, 5, 7)
 
-        # self.conv1 = nn.Conv3d(3, 6, kernel_size=kernel_size, padding='same')
-        # self.relu1 = nn.ReLU()
-        # self.conv2 = nn.Conv3d(6, 12, kernel_size=kernel_size, padding='same')
+        self.conv1 = nn.Conv3d(3, 6, kernel_size=kernel_size, padding='same')
+        self.relu1 = nn.ReLU()
+        self.conv2 = nn.Conv3d(6, 3, kernel_size=kernel_size, padding='same')
         # self.relu2 = nn.ReLU()
         # self.conv3 = nn.Conv3d(12, 24, kernel_size=kernel_size, padding='same')
         # self.relu3 = nn.ReLU()
@@ -173,14 +173,14 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         # self.relu5 = nn.ReLU()
         # self.conv6 = nn.Conv3d(6, 3, kernel_size=kernel_size, padding='same')
 
-        # self.dropout = nn.Dropout3d(p=0.1)  # Increased dropout for stronger regularization
+        # self.dropout = nn.Dropout3d(p=self.p_drop)  # Increased dropout for stronger regularization
         # self.temporal_mix = nn.Parameter(torch.tensor(0.85))  # Start with 85% temporal
 
         # # Initialize temporal smoothing layers
-        # for m in [self.conv1, self.conv2, self.conv3, self.conv4, self.conv5, self.conv6]:
-        #     nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        #     if m.bias is not None:
-        #         nn.init.constant_(m.bias, 0)
+        for m in [self.conv1, self.conv2]: # self.conv3, self.conv4, self.conv5, self.conv6]:
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
         self.counter = 0
         self.params = params
@@ -212,14 +212,14 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         # original_mask = mask.clone()
 
         # Temporal smoothing
-        mask = self.block1(mask)
-        mask = self.block2(mask)
-        mask = self.block3(mask)
+        # mask = self.block1(mask)
+        # mask = self.block2(mask)
+        # mask = self.block3(mask)
 
-        # mask = self.conv1(mask)
-        # mask = self.relu1(mask)
+        mask = self.conv1(mask)
+        mask = self.relu1(mask)
         # mask = self.dropout(mask) if self.training else mask
-        # mask = self.conv2(mask)
+        mask = self.conv2(mask)
         # mask = self.relu2(mask)
         # mask = self.dropout(mask) if self.training else mask
         # mask = self.conv3(mask)
@@ -233,10 +233,6 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         # mask = self.dropout(mask) if self.training else mask
         # mask = self.conv6(mask)
 
-        # mask = (
-        #     torch.sigmoid(self.temporal_mix) * mask + 
-        #     (1 - torch.sigmoid(self.temporal_mix)) * original_mask
-        # )
         # mask = (
         #     torch.sigmoid(self.temporal_mix) * mask + 
         #     (1 - torch.sigmoid(self.temporal_mix)) * original_mask
@@ -311,8 +307,7 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         
         # Log to wandb less frequently to reduce overhead
         if batch_idx % 10 == 0:
-            run.log({'train_loss': loss.item(), 'lr': self.optimizers().param_groups[0]['lr'], 'temporal_mix': torch.sigmoid(self.temporal_mix).item()})
-            run.log({'train_loss': loss.item(), 'lr': self.optimizers().param_groups[0]['lr'], 'temporal_mix': torch.sigmoid(self.temporal_mix).item()})
+            run.log({'train_loss': loss.item(), 'lr': self.optimizers().param_groups[0]['lr']}) #'temporal_mix': torch.sigmoid(self.temporal_mix).item()})
         
         return loss
 
@@ -334,7 +329,7 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
                 'val_pfa': pfa.item() if isinstance(pfa, torch.Tensor) else pfa,
                 'val_cd': cd,
                 'lr': self.hparams.lr,
-                'temporal_mix': torch.sigmoid(self.temporal_mix).item(),
+                # 'temporal_mix': torch.sigmoid(self.temporal_mix).item(),
                 }
             )
         
@@ -419,7 +414,6 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
-            factor=0.5,      # Less aggressive reduction since we have cosine
             factor=0.5,      # Less aggressive reduction since we have cosine
             patience=8,      # Higher patience to let cosine schedule work
             # verbose=True,  # removed from pytorch 2.7
@@ -534,12 +528,12 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
 def main(params, resume_checkpoint=None, debug=False):
     # Start a new wandb run to track this script.
     global run
-    model_name = 'resnet101'
-    checkpointt_directory = f"checkpoints-{model_name}"
+    model_name = 'resnet50'
+    checkpoint_directory = f"checkpoints-{model_name}-t2"
     if resume_checkpoint:
         ckpt_dir = os.path.dirname(resume_checkpoint)
     else: 
-        ckpt_dir = checkpointt_directory
+        ckpt_dir = checkpoint_directory
         
     run_id_file = os.path.join(ckpt_dir, "wandb_run_id.txt")
     if resume_checkpoint and os.path.exists(run_id_file):
@@ -550,9 +544,9 @@ def main(params, resume_checkpoint=None, debug=False):
             entity="will_70330",
             project="RISS-Research-RaDelft",
             config={
-                "architecture": f"{model_name}-ZeusTraining-CompleteTemporalMix",
+                "architecture": f"{model_name}-t2",
                 "dataset": "RaDelft",
-                "epochs": 45,
+                "epochs": 50,
             },
             id=old_id,
             resume="allow"
@@ -563,9 +557,9 @@ def main(params, resume_checkpoint=None, debug=False):
             entity="will_70330",
             project="RISS-Research-RaDelft",
             config={
-                "architecture": f"{model_name}-ZeusTraining-CompleteTemporalMix",
+                "architecture": f"{model_name}-t2",
                 "dataset": "RaDelft",
-                "epochs": 45,
+                "epochs": 50,
             }
         )
         # check for exisiting checkpoint folder and write run ID
@@ -578,17 +572,17 @@ def main(params, resume_checkpoint=None, debug=False):
     val_dataset = RADCUBE_DATASET_TIME(mode='val', params=params)
 
     # Create training and validation data loaders
-    batch_size = 3  # Limited by GPU memory
-    num_workers = 18 # Limited by CPU
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False, prefetch_factor=2)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False, prefetch_factor=1)
-    model = NeuralNetworkRadarDetector("FPN", f"{model_name}", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES, lr=1e-4, debug=False, use_groupNorm=True)
+    batch_size = 4  # Limited by GPU memory
+    num_workers = 12 # Limited by CPU
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=False)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=False)
+    model = NeuralNetworkRadarDetector("FPN", f"{model_name}", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES, lr=1e-4, debug=False, use_groupNorm=False, p_drop=0.2)
 
     checkpoint_callback = ModelCheckpoint(
         monitor="val_loss",
-        dirpath=checkpointt_directory,
-        filename="model-{epoch:02d}-{val_loss:.4f}",
-        save_top_k=5,   # keep best 5 models
+        dirpath=checkpoint_directory,
+        filename="resnet50-t2-{epoch:02d}-{val_loss:.4f}",
+        save_top_k=10,   # keep best 5 models
         mode="min",     # because we're minimizing loss
         save_last=True, # always save the last checkpoint
         verbose=True,
@@ -599,12 +593,11 @@ def main(params, resume_checkpoint=None, debug=False):
         strategy="auto",         # We need this for multi-GPU / High Accumulated Batches since we want to sync BN
         sync_batchnorm=True,
         devices=1,
-        max_epochs=45,
+        max_epochs=50,
         precision="16-mixed",
-        accumulate_grad_batches=4,
-        accumulate_grad_batches=4,
+        accumulate_grad_batches=2,
         callbacks=[checkpoint_callback, RichProgressBar(leave=True, theme=RichProgressBarTheme(metrics_format='.4e'))],
-        gradient_clip_val=0.2,
+        gradient_clip_val=0.25,
     )
     trainer.fit(
         model,
@@ -631,7 +624,7 @@ if __name__ == "__main__":
     params = data_preparation.get_default_params()
 
     # Initialise parameters
-    params["dataset_path"] = '/media/muckelroyiii/Mass-Storage/RaDelft/'
+    params["dataset_path"] = '/media/muckelroyiii/Mass-Storage/RaDelft'
     params["train_val_scenes"] = [1,3,4,5,7]
     params["test_scenes"] = [2,6]
     params["train_test_split_percent"] = 0.8
@@ -641,8 +634,8 @@ if __name__ == "__main__":
     # This must be kept to false. If the network without elevation is needed, use network_noElevation.py instead
     params["bev"] = False
 
-    checkpoint_path = '/home/muckelroyiii/Desktop/riss-research/checkpoints-resnet101/last.ckpt'
+    checkpoint_path = '/home/muckelroyiii/Desktop/riss-research/checkpoints-resnet50-t2/last.ckpt'
 
     # This trains the NN
-    # main(params, resume_checkpoint=checkpoint_path)
-    main(params, debug=False)
+    main(params, resume_checkpoint=checkpoint_path)
+    # main(params, debug=False)

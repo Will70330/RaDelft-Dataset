@@ -415,16 +415,21 @@ def cube_to_pointcloud(cube, params, radar_cube, mode='radar', dop_fold_path=Non
 
         # If the unfolded Doppler is provided, correct the speed value
         if dop_fold_path is not None:
-            doppler_fold = scipy.io.loadmat(dop_fold_path)["dopplerFold"]
+            # print(f"\n\nDoppler Fold Path: {dop_fold_path}\n\n")
+            doppler_fold = scipy.io.loadmat(dop_fold_path)["elevationIndex"] # ["dopplerFold"]
+            # print(f"\n\nDoppler Fold: {doppler_fold}\n\n")
             doppler_fold = doppler_fold - 1  # Matlab Python 1 to 0
             doppler_corrected = doppler_fold[nonzero_indices[:, 1], doppler_indices]
             vel_value = (doppler_corrected - vel_fft_size / 2) * vel_bin_size
+            # print(f"\n\nVelocity Values:\n{vel_value}")
 
     # If the cube is a lidar cube
     else:
         cube = torch.squeeze(cube)
         nonzero_indices = torch.nonzero(cube)
         nonzero_indices = nonzero_indices.numpy()
+        # print(f"\n\nnonzero_indices max: {nonzero_indices[:, 1].max()}")
+        # print(f"range_axis size: {len(range_axis)}\n\n")
         range_values = range_axis[nonzero_indices[:, 1]]
         azimuth_values = azimuth_axis[nonzero_indices[:, 2]]
         elevation_values = elevation_axis[nonzero_indices[:, 0] - 1]
@@ -434,7 +439,8 @@ def cube_to_pointcloud(cube, params, radar_cube, mode='radar', dop_fold_path=Non
 
     # Only radar has velocity values
     if mode == 'radar':
-        vel_value = np.expand_dims(vel_value, 1)
+        vel_value = np.expand_dims(vel_value, 1) if dop_fold_path is None else vel_value
+        # print(f"\n\nVel Values:\n{vel_value}")
         radar_pc = np.hstack((radar_pc, vel_value))
 
     return radar_pc
