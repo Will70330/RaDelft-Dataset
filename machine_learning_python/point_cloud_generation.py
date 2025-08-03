@@ -55,17 +55,17 @@ def compute_pc(radar_cube, lidar_cube, data_dict, output, i, batch_idx, overwrit
         print(save_path) if print_path and batch_idx == 1 else None
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-        print(f"\nOutput shape: {output[i, :, :, :].shape}")
-        print(f"\nRadar cube shape: {radar_cube[i, :, :, :, :].shape}\n")
+        # print(f"\nOutput shape: {output[i, :, :, :].shape}")
+        # print(f"\nRadar cube shape: {radar_cube[i, :, :, :, :].shape}\n")
         radar_pc = data_preparation.cube_to_pointcloud(
-            output[i, :, :, :],
-            params, radar_cube[i, :, :, :, :],
-            data_dict["elevation_path"][i], 'radar')
+            cube=output[i, :, :, :],
+            params=params,
+            radar_cube=radar_cube[i, :, :, :, :],
+            mode='radar',
+            # dop_fold_path=data_dict["elevation_path"][i]
+        )
 
         radar_pc[:, 2] = -radar_pc[:, 2]
-        
-        save_path = re.sub(r"radar_.+/", r"network/", cfar_path)
-        print(save_path)
 
         # Save Result
         np.save(save_path, radar_pc)
@@ -95,11 +95,11 @@ def compute_pc(radar_cube, lidar_cube, data_dict, output, i, batch_idx, overwrit
             # save result
             np.save(save_path, radar_pc)
 
-def generate_point_clouds(params, checkpoints, print_path=False, overwrite_pc=False):
+def generate_point_clouds(params, checkpoints, print_path=False, overwrite_pc=False, use_temporal=False):
     # Check for GPU availability
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
-    eval_modes = ['val']
+    eval_modes = ['test']
 
     # Generate PCs based on each model checkpoint path
     for checkpoint in checkpoints:
@@ -110,7 +110,11 @@ def generate_point_clouds(params, checkpoints, print_path=False, overwrite_pc=Fa
         # Load Model
         try: 
             cp = torch.load(checkpoint, map_location=device, weights_only=False) # Load checkpoint to device (GPU)
-            model = nnDetector(arch='FPN', encoder_name='resnet18', params=params, in_channels=64, out_classes=34, use_groupNorm=False)
+            use_groupNorm = False if model_name == 'resnet18' or model_name == 'resnet50' else True
+            if not use_temporal:
+                model = nnDetector(arch='FPN', encoder_name=model_name, params=params, in_channels=64, out_classes=34, use_groupNorm=use_groupNorm)
+            else:
+                model = nnDetector_time(arch='FPN', encoder_name=model_name, params=params, in_channels=64, out_classes=34, use_groupNorm=use_groupNorm)
             model.load_state_dict(cp['state_dict'])
         except Exception as e:
             print(f'Error loading model ({ckpt_name}) from checkpoint {checkpoint}: {e}')
@@ -121,8 +125,8 @@ def generate_point_clouds(params, checkpoints, print_path=False, overwrite_pc=Fa
         for mode in eval_modes:
             # Construct Data Loader
             # dataset = RADCUBE_DATASET_TIME(mode=mode, params=params)
-            dataset = RADCUBE_DATASET(mode=mode, params=params)
-            loader = DataLoader(dataset, batch_size=16, shuffle=False, num_workers=16, pin_memory=False, prefetch_factor=1)
+            dataset = RADCUBE_DATASET(mode=mode, params=params) if not use_temporal else RADCUBE_DATASET_TIME(mode=mode, params=params)
+            loader = DataLoader(dataset, batch_size=12, shuffle=False, num_workers=16, pin_memory=False, prefetch_factor=2)
 
             # Create base directory structure
             base_network_path = f'network/{ckpt_name}/{mode}/'
@@ -148,7 +152,7 @@ def generate_point_clouds(params, checkpoints, print_path=False, overwrite_pc=Fa
                             radar_cube=radar_cube_cpu, lidar_cube=lidar_cube, data_dict=data_dict,
                             output=output_cpu, i = i, batch_idx=batch_idx,
                             base_network_path=base_network_path, file_skip_counter=file_skip_counter,
-                            print_path=True, use_temporal=False, overwrite_pc=True
+                            print_path=print_path, use_temporal=use_temporal, overwrite_pc=overwrite_pc
                         )
                         
 
@@ -180,20 +184,20 @@ if __name__ == "__main__":
     params["bev"] = False
 
     checkpoint_paths = {
-        '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet18-t0-epoch=14-val_loss=0.0012.ckpt',
+        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet18-t0-epoch=14-val_loss=0.0012.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet18-t4-epoch=19-val_loss=0.0004.ckpt',
-        '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t0-epoch=29-val_loss=0.0011.ckpt',
-        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t2-epoch=39-val_loss=0.0015.ckpt',
+        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t0-epoch=29-val_loss=0.0011.ckpt',
+        '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t2-epoch=39-val_loss=0.0015.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t4-new-epoch=34-val_loss=0.0016.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t2-epoch=29-val_loss=0.0033.ckpt',
-        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t2-epoch=34-val_loss=0.0016.ckpt',
+        '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t2-epoch=34-val_loss=0.0016.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t4-epoch=19-val_loss=0.0004.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t4-new-epoch=39-val_loss=0.0017.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t6-epoch=39-val_loss=0.0016.ckpt',
-        '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet152-t0-epoch=34-val_loss=0.0012.ckpt',
+        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet152-t0-epoch=34-val_loss=0.0012.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet152-t4-epoch=39-val_loss=0.0016.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/xception-epoch=21-val_loss=0.0054.ckpt'
     }
 
-    generate_point_clouds(params, checkpoint_paths, print_path=True, overwrite_pc=True)
+    generate_point_clouds(params, checkpoint_paths, print_path=True, overwrite_pc=True, use_temporal=True)
 
