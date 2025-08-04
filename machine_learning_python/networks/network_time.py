@@ -161,23 +161,25 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         
         kernel_size = (3, 5, 7)
 
+        # layer_size = 6 if encoder_name == 'resnet50' else 12
+
         self.conv1 = nn.Conv3d(3, 6, kernel_size=kernel_size, padding='same')
         self.relu1 = nn.ReLU()
-        self.conv2 = nn.Conv3d(6, 3, kernel_size=kernel_size, padding='same')
-        # self.relu2 = nn.ReLU()
-        # self.conv3 = nn.Conv3d(12, 24, kernel_size=kernel_size, padding='same')
-        # self.relu3 = nn.ReLU()
-        # self.conv4 = nn.Conv3d(24, 12, kernel_size=kernel_size, padding='same')
-        # self.relu4 = nn.ReLU()
-        # self.conv5 = nn.Conv3d(12, 6, kernel_size=kernel_size, padding='same')
-        # self.relu5 = nn.ReLU()
-        # self.conv6 = nn.Conv3d(6, 3, kernel_size=kernel_size, padding='same')
+        self.conv2 = nn.Conv3d(6, 12, kernel_size=kernel_size, padding='same')
+        self.relu2 = nn.ReLU()
+        self.conv3 = nn.Conv3d(12, 24, kernel_size=kernel_size, padding='same')
+        self.relu3 = nn.ReLU()
+        self.conv4 = nn.Conv3d(24, 12, kernel_size=kernel_size, padding='same')
+        self.relu4 = nn.ReLU()
+        self.conv5 = nn.Conv3d(12, 6, kernel_size=kernel_size, padding='same')
+        self.relu5 = nn.ReLU()
+        self.conv6 = nn.Conv3d(6, 3, kernel_size=kernel_size, padding='same')
 
         # self.dropout = nn.Dropout3d(p=self.p_drop)  # Increased dropout for stronger regularization
-        # self.temporal_mix = nn.Parameter(torch.tensor(0.85))  # Start with 85% temporal
+        self.temporal_mix = nn.Parameter(torch.tensor(0.85))  # Start with 85% temporal
 
         # # Initialize temporal smoothing layers
-        for m in [self.conv1, self.conv2]: # self.conv3, self.conv4, self.conv5, self.conv6]:
+        for m in [self.conv1, self.conv2, self.conv3, self.conv4]: # , self.conv5, self.conv6]:
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
@@ -220,18 +222,18 @@ class NeuralNetworkRadarDetector(pl.LightningModule):
         mask = self.relu1(mask)
         # mask = self.dropout(mask) if self.training else mask
         mask = self.conv2(mask)
-        # mask = self.relu2(mask)
+        mask = self.relu2(mask)
         # mask = self.dropout(mask) if self.training else mask
-        # mask = self.conv3(mask)
-        # mask = self.relu3(mask)
+        mask = self.conv3(mask)
+        mask = self.relu3(mask)
         # mask = self.dropout(mask) if self.training else mask
-        # mask = self.conv4(mask)
-        # mask = self.relu4(mask)
+        mask = self.conv4(mask)
+        mask = self.relu4(mask)
         # mask = self.dropout(mask) if self.training else mask
-        # mask = self.conv5(mask)
-        # mask = self.relu5(mask)
+        mask = self.conv5(mask)
+        mask = self.relu5(mask)
         # mask = self.dropout(mask) if self.training else mask
-        # mask = self.conv6(mask)
+        mask = self.conv6(mask)
 
         # mask = (
         #     torch.sigmoid(self.temporal_mix) * mask + 

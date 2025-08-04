@@ -126,7 +126,7 @@ def generate_point_clouds(params, checkpoints, print_path=False, overwrite_pc=Fa
             # Construct Data Loader
             # dataset = RADCUBE_DATASET_TIME(mode=mode, params=params)
             dataset = RADCUBE_DATASET(mode=mode, params=params) if not use_temporal else RADCUBE_DATASET_TIME(mode=mode, params=params)
-            loader = DataLoader(dataset, batch_size=12, shuffle=False, num_workers=16, pin_memory=False, prefetch_factor=2)
+            loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=16, pin_memory=False)
 
             # Create base directory structure
             base_network_path = f'network/{ckpt_name}/{mode}/'
@@ -187,15 +187,15 @@ if __name__ == "__main__":
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet18-t0-epoch=14-val_loss=0.0012.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet18-t4-epoch=19-val_loss=0.0004.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t0-epoch=29-val_loss=0.0011.ckpt',
-        '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t2-epoch=39-val_loss=0.0015.ckpt',
+        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t2-epoch=39-val_loss=0.0015.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t4-new-epoch=34-val_loss=0.0016.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t2-epoch=29-val_loss=0.0033.ckpt',
-        '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t2-epoch=34-val_loss=0.0016.ckpt',
+        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t2-epoch=34-val_loss=0.0016.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t4-epoch=19-val_loss=0.0004.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t4-new-epoch=39-val_loss=0.0017.ckpt',
-        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t6-epoch=39-val_loss=0.0016.ckpt',
+        '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t6-epoch=39-val_loss=0.0016.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet152-t0-epoch=34-val_loss=0.0012.ckpt',
-        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet152-t4-epoch=39-val_loss=0.0016.ckpt',
+        '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet152-t6-epoch=39-val_loss=0.0016.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/xception-epoch=21-val_loss=0.0054.ckpt'
     }
 
