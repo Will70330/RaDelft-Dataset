@@ -1,0 +1,23 @@
+Model,Pd,Pfa,Chamfer Distance
+CFAR-resnet101-t0-test,0.000,0.000,0.000
+CFAR-resnet101-t2-test,0.000,0.000,0.000
+CFAR-resnet101-t4-new-test,0.000,0.000,0.000
+CFAR-resnet101-t6-test,0.000,0.000,0.000
+CFAR-resnet152-t0-test,0.000,0.000,0.000
+CFAR-resnet152-t6-test,0.000,0.000,0.000
+CFAR-resnet18-t0-test,0.000,0.000,0.000
+CFAR-resnet18-t4-test,0.000,0.000,0.000
+CFAR-resnet50-t2-test,0.000,0.000,0.000
+CFAR-resnet50-t4-test,0.000,0.000,0.000
+CFAR-xception-test,0.000,0.000,0.000
+resnet101-t0-test,0.591,0.073,2.532
+resnet101-t2-test,0.589,0.038,1.834
+resnet101-t4-new-test,0.000,0.000,inf
+resnet101-t6-test,0.000,0.000,inf
+resnet152-t0-test,0.589,0.073,2.517
+resnet152-t6-test,0.000,0.000,inf
+resnet18-t0-test,0.553,0.065,2.682
+resnet18-t4-test,0.658,0.019,1.247
+resnet50-t2-test,0.541,0.042,2.157
+resnet50-t4-test,0.648,0.018,1.176
+xception-test,0.000,0.000,inf

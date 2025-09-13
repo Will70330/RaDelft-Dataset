@@ -96,70 +96,104 @@ def compute_pc(radar_cube, lidar_cube, data_dict, output, i, batch_idx, overwrit
             np.save(save_path, radar_pc)
 
 def generate_point_clouds(params, checkpoints, print_path=False, overwrite_pc=False, use_temporal=False):
-    # Check for GPU availability
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
-    eval_modes = ['test']
+    path = '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t0-epoch=27-val_loss=0.0016.ckpt'
+    ckpt_name, model_name = extract_model_name(path)
+    base_network_path = f'network/{ckpt_name}/test/'
+    # NOTE file is not always readable, permissions can be fucked
+    checkpoint = torch.load(path, weights_only=False)
+    model = nnDetector("FPN", "resnet50", params, in_channels=IN_CHANNELS, out_classes=OUT_CLASSES)
+    model.load_state_dict(checkpoint['state_dict'])
+    model.eval()
 
-    # Generate PCs based on each model checkpoint path
-    for checkpoint in checkpoints:
+    # Create Loader
+    val_dataset = RADCUBE_DATASET(mode='test', params=params)
 
-        # Grab the model name
-        ckpt_name, model_name = extract_model_name(checkpoint)
+    # Create training and validation data loaders
+    num_workers = 16
+    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=num_workers, pin_memory=False)
+    counter = 0
+
+    for batch in tqdm(val_loader):
+        counter = counter + 1
+        radar_cube, lidar_cube, data_dict = batch
+
+        with torch.no_grad():
+            output = model(radar_cube)
+            for i in range(lidar_cube.shape[0]):
+                radar_pc = data_preparation.cube_to_pointcloud(cube=output[i, :, :, :], params=params, radar_cube=radar_cube[i, :, :, :, :],
+                                                               dop_fold_path=data_dict["elevation_path"][i], mode='radar')
+
+                radar_pc[:, 2] = -radar_pc[:, 2]
+
+                cfar_path = data_dict["cfar_path"][i]
+                save_path = re.sub(r"radar_.+/", rf'{base_network_path}', cfar_path)
+                # print(save_path)
+
+                np.save(save_path, radar_pc)
+    # # Check for GPU availability
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # print(f'Using device: {device}')
+    # eval_modes = ['test']
+
+    # # Generate PCs based on each model checkpoint path
+    # for checkpoint in checkpoints:
+
+    #     # Grab the model name
+    #     ckpt_name, model_name = extract_model_name(checkpoint)
         
-        # Load Model
-        try: 
-            cp = torch.load(checkpoint, map_location=device, weights_only=False) # Load checkpoint to device (GPU)
-            use_groupNorm = False if model_name == 'resnet18' or model_name == 'resnet50' else True
-            if not use_temporal:
-                model = nnDetector(arch='FPN', encoder_name=model_name, params=params, in_channels=64, out_classes=34, use_groupNorm=use_groupNorm)
-            else:
-                model = nnDetector_time(arch='FPN', encoder_name=model_name, params=params, in_channels=64, out_classes=34, use_groupNorm=use_groupNorm)
-            model.load_state_dict(cp['state_dict'])
-        except Exception as e:
-            print(f'Error loading model ({ckpt_name}) from checkpoint {checkpoint}: {e}')
-            continue
-        model.to(device)
-        model.eval()
+    #     # Load Model
+    #     try: 
+    #         cp = torch.load(checkpoint, map_location=device, weights_only=False) # Load checkpoint to device (GPU)
+    #         use_groupNorm = False if model_name == 'resnet18' or model_name == 'resnet50' else True
+    #         if not use_temporal:
+    #             model = nnDetector(arch='FPN', encoder_name=model_name, params=params, in_channels=64, out_classes=34, use_groupNorm=False)
+    #         else:
+    #             model = nnDetector_time(arch='FPN', encoder_name=model_name, params=params, in_channels=64, out_classes=34, use_groupNorm=use_groupNorm)
+    #         model.load_state_dict(cp['state_dict'])
+    #     except Exception as e:
+    #         print(f'Error loading model ({ckpt_name}) from checkpoint {checkpoint}: {e}')
+    #         continue
+    #     model.to(device)
+    #     model.eval()
 
-        for mode in eval_modes:
-            # Construct Data Loader
-            # dataset = RADCUBE_DATASET_TIME(mode=mode, params=params)
-            dataset = RADCUBE_DATASET(mode=mode, params=params) if not use_temporal else RADCUBE_DATASET_TIME(mode=mode, params=params)
-            loader = DataLoader(dataset, batch_size=12, shuffle=False, num_workers=16, pin_memory=False, prefetch_factor=2)
+    #     for mode in eval_modes:
+    #         # Construct Data Loader
+    #         # dataset = RADCUBE_DATASET_TIME(mode=mode, params=params)
+    #         dataset = RADCUBE_DATASET(mode=mode, params=params) if not use_temporal else RADCUBE_DATASET_TIME(mode=mode, params=params)
+    #         loader = DataLoader(dataset, batch_size=12, shuffle=False, num_workers=16, pin_memory=False, prefetch_factor=2)
 
-            # Create base directory structure
-            base_network_path = f'network/{ckpt_name}/{mode}/'
-            file_skip_counter = 0
+    #         # Create base directory structure
+    #         base_network_path = f'network/{ckpt_name}/{mode}/'
+    #         file_skip_counter = 0
 
-            # Actual Generation of the point clouds
-            for batch_idx, batch in tqdm(enumerate(loader), desc=f'generating point clouds for {ckpt_name}: {mode}', unit='batch(s)'):
-                radar_cube, lidar_cube, data_dict = batch
+    #         # Actual Generation of the point clouds
+    #         for batch_idx, batch in tqdm(enumerate(loader), desc=f'generating point clouds for {ckpt_name}: {mode}', unit='batch(s)'):
+    #             radar_cube, lidar_cube, data_dict = batch
 
-                # Move data to GPU
-                radar_cube = radar_cube.to(device, non_blocking=True)
-                lidar_cube = lidar_cube.to(device, non_blocking=True)
+    #             # Move data to GPU
+    #             radar_cube = radar_cube.to(device, non_blocking=True)
+    #             lidar_cube = lidar_cube.to(device, non_blocking=True)
 
-                with torch.no_grad():
-                    output = model(radar_cube)
+    #             with torch.no_grad():
+    #                 output = model(radar_cube)
 
-                    # Move output back to CPU for post-processing
-                    output_cpu = output.cpu()
-                    radar_cube_cpu = radar_cube.cpu()
+    #                 # Move output back to CPU for post-processing
+    #                 output_cpu = output.cpu()
+    #                 radar_cube_cpu = radar_cube.cpu()
 
-                    for i in range(lidar_cube.shape[0]):
-                        compute_pc(
-                            radar_cube=radar_cube_cpu, lidar_cube=lidar_cube, data_dict=data_dict,
-                            output=output_cpu, i = i, batch_idx=batch_idx,
-                            base_network_path=base_network_path, file_skip_counter=file_skip_counter,
-                            print_path=print_path, use_temporal=use_temporal, overwrite_pc=overwrite_pc
-                        )
+    #                 for i in range(lidar_cube.shape[0]):
+    #                     compute_pc(
+    #                         radar_cube=radar_cube_cpu, lidar_cube=lidar_cube, data_dict=data_dict,
+    #                         output=output_cpu, i = i, batch_idx=batch_idx,
+    #                         base_network_path=base_network_path, file_skip_counter=file_skip_counter,
+    #                         print_path=print_path, use_temporal=use_temporal, overwrite_pc=overwrite_pc
+    #                     )
                         
 
-            print(f'PC Overwriting set to {overwrite_pc}, skipped overwriting {file_skip_counter} files...')
-        # Free up GPU Memory
-        del model, cp
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    #         print(f'PC Overwriting set to {overwrite_pc}, skipped overwriting {file_skip_counter} files...')
+    #     # Free up GPU Memory
+    #     del model, cp
+    #     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
 if __name__ == "__main__":
 
@@ -186,11 +220,15 @@ if __name__ == "__main__":
     checkpoint_paths = {
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet18-t0-epoch=14-val_loss=0.0012.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet18-t4-epoch=19-val_loss=0.0004.ckpt',
+        '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t0-epoch=27-val_loss=0.0016.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t0-epoch=29-val_loss=0.0011.ckpt',
-        '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t2-epoch=39-val_loss=0.0015.ckpt',
+        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t2-epoch=39-val_loss=0.0015.ckpt',
+        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t4-epoch=17-val_loss=0.0004.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet50-t4-new-epoch=34-val_loss=0.0016.ckpt',
+        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t0-epoch=19-val_loss=0.0012.ckpt',
+        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t0-epoch=34-val_loss=0.0012.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t2-epoch=29-val_loss=0.0033.ckpt',
-        '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t2-epoch=34-val_loss=0.0016.ckpt',
+        # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t2-epoch=34-val_loss=0.0016.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t4-epoch=19-val_loss=0.0004.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t4-new-epoch=39-val_loss=0.0017.ckpt',
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/resnet101-t6-epoch=39-val_loss=0.0016.ckpt',
@@ -199,5 +237,5 @@ if __name__ == "__main__":
         # '/home/muckelroyiii/Desktop/riss-research/results_collection/xception-epoch=21-val_loss=0.0054.ckpt'
     }
 
-    generate_point_clouds(params, checkpoint_paths, print_path=True, overwrite_pc=True, use_temporal=True)
+    generate_point_clouds(params, checkpoint_paths, print_path=True, overwrite_pc=True, use_temporal=False)
 
